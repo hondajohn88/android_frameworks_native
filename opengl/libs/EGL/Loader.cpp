@@ -14,24 +14,31 @@
  ** limitations under the License.
  */
 
-#include <ctype.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <errno.h>
-#include <dlfcn.h>
-#include <limits.h>
-#include <dirent.h>
+//#define LOG_NDEBUG 0
+#define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
-#include <cutils/log.h>
-#include <cutils/properties.h>
-
-#include <EGL/egl.h>
-
-#include "../glestrace.h"
-
-#include "egldefs.h"
 #include "Loader.h"
+
+#include <string>
+
+#include <dirent.h>
+#include <dlfcn.h>
+
+#include <android/dlext.h>
+#include <cutils/properties.h>
+#include <log/log.h>
+
+#ifndef __ANDROID_VNDK__
+#include <graphicsenv/GraphicsEnv.h>
+#endif
+#include <vndksupport/linker.h>
+
+#include "egl_trace.h"
+#include "egldefs.h"
+
+extern "C" {
+  android_namespace_t* android_get_exported_namespace(const char*);
+}
 
 // ----------------------------------------------------------------------------
 namespace android {
@@ -61,7 +68,10 @@ namespace android {
  *
  */
 
-ANDROID_SINGLETON_STATIC_INSTANCE( Loader )
+Loader& Loader::getInstance() {
+    static Loader loader;
+    return loader;
+}
 
 /* This function is called to check whether we run inside the emulator,
  * and if this is the case whether GLES GPU emulation is supported.
@@ -70,7 +80,9 @@ ANDROID_SINGLETON_STATIC_INSTANCE( Loader )
  *  -1   -> not running inside the emulator
  *   0   -> running inside the emulator, but GPU emulation not supported
  *   1   -> running inside the emulator, GPU emulation is supported
- *          through the "emulation" config.
+ *          through the "emulation" host-side OpenGL ES implementation.
+ *   2   -> running inside the emulator, GPU emulation is supported
+ *          through a guest-side vendor driver's OpenGL ES implementation.
  */
 static int
 checkGlesEmulationStatus(void)
@@ -92,26 +104,23 @@ checkGlesEmulationStatus(void)
         return -1;
 
     /* We are in the emulator, get GPU status value */
-    property_get("ro.kernel.qemu.gles",prop,"0");
+    property_get("qemu.gles",prop,"0");
     return atoi(prop);
 }
 
-// ----------------------------------------------------------------------------
+static void* do_dlopen(const char* path, int mode) {
+    ATRACE_CALL();
+    return dlopen(path, mode);
+}
 
-static char const * getProcessCmdline() {
-    long pid = getpid();
-    char procPath[128];
-    snprintf(procPath, 128, "/proc/%ld/cmdline", pid);
-    FILE * file = fopen(procPath, "r");
-    if (file) {
-        static char cmdline[256];
-        char *str = fgets(cmdline, sizeof(cmdline) - 1, file);
-        fclose(file);
-        if (str) {
-            return cmdline;
-        }
-    }
-    return NULL;
+static void* do_android_dlopen_ext(const char* path, int mode, const android_dlextinfo* info) {
+    ATRACE_CALL();
+    return android_dlopen_ext(path, mode, info);
+}
+
+static void* do_android_load_sphal_library(const char* path, int mode) {
+    ATRACE_CALL();
+    return android_load_sphal_library(path, mode);
 }
 
 // ----------------------------------------------------------------------------
@@ -133,7 +142,7 @@ Loader::driver_t::~driver_t()
     }
 }
 
-status_t Loader::driver_t::set(void* hnd, int32_t api)
+int Loader::driver_t::set(void* hnd, int32_t api)
 {
     switch (api) {
         case EGL:
@@ -146,31 +155,75 @@ status_t Loader::driver_t::set(void* hnd, int32_t api)
             dso[2] = hnd;
             break;
         default:
-            return BAD_INDEX;
+            return -EOVERFLOW;
     }
-    return NO_ERROR;
+    return 0;
 }
 
 // ----------------------------------------------------------------------------
 
 Loader::Loader()
-    : getProcAddress(NULL) {
+    : getProcAddress(NULL)
+{
 }
 
 Loader::~Loader() {
-    GLTrace_stop();
 }
 
 static void* load_wrapper(const char* path) {
-    void* so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+    void* so = do_dlopen(path, RTLD_NOW | RTLD_LOCAL);
     ALOGE_IF(!so, "dlopen(\"%s\") failed: %s", path, dlerror());
     return so;
 }
 
+#ifndef EGL_WRAPPER_DIR
+#if defined(__LP64__)
+#define EGL_WRAPPER_DIR "/system/lib64"
+#else
+#define EGL_WRAPPER_DIR "/system/lib"
+#endif
+#endif
+
+static void setEmulatorGlesValue(void) {
+    char prop[PROPERTY_VALUE_MAX];
+    property_get("ro.kernel.qemu", prop, "0");
+    if (atoi(prop) != 1) return;
+
+    property_get("ro.kernel.qemu.gles",prop,"0");
+    if (atoi(prop) == 1) {
+        ALOGD("Emulator has host GPU support, qemu.gles is set to 1.");
+        property_set("qemu.gles", "1");
+        return;
+    }
+
+    // for now, checking the following
+    // directory is good enough for emulator system images
+    const char* vendor_lib_path =
+#if defined(__LP64__)
+        "/vendor/lib64/egl";
+#else
+        "/vendor/lib/egl";
+#endif
+
+    const bool has_vendor_lib = (access(vendor_lib_path, R_OK) == 0);
+    if (has_vendor_lib) {
+        ALOGD("Emulator has vendor provided software renderer, qemu.gles is set to 2.");
+        property_set("qemu.gles", "2");
+    } else {
+        ALOGD("Emulator without GPU support detected. "
+              "Fallback to legacy software renderer, qemu.gles is set to 0.");
+        property_set("qemu.gles", "0");
+    }
+}
+
 void* Loader::open(egl_connection_t* cnx)
 {
+    ATRACE_CALL();
+
     void* dso;
     driver_t* hnd = 0;
+
+    setEmulatorGlesValue();
 
     dso = load_driver("GLES", cnx, EGL | GLESv1_CM | GLESv2);
     if (dso) {
@@ -187,15 +240,10 @@ void* Loader::open(egl_connection_t* cnx)
 
     LOG_ALWAYS_FATAL_IF(!hnd, "couldn't find an OpenGL ES implementation");
 
-#if defined(__LP64__)
-    cnx->libEgl   = load_wrapper("/system/lib64/libEGL.so");
-    cnx->libGles2 = load_wrapper("/system/lib64/libGLESv2.so");
-    cnx->libGles1 = load_wrapper("/system/lib64/libGLESv1_CM.so");
-#else
-    cnx->libEgl   = load_wrapper("/system/lib/libEGL.so");
-    cnx->libGles2 = load_wrapper("/system/lib/libGLESv2.so");
-    cnx->libGles1 = load_wrapper("/system/lib/libGLESv1_CM.so");
-#endif
+    cnx->libEgl   = load_wrapper(EGL_WRAPPER_DIR "/libEGL.so");
+    cnx->libGles2 = load_wrapper(EGL_WRAPPER_DIR "/libGLESv2.so");
+    cnx->libGles1 = load_wrapper(EGL_WRAPPER_DIR "/libGLESv1_CM.so");
+
     LOG_ALWAYS_FATAL_IF(!cnx->libEgl,
             "couldn't load system EGL wrapper libraries");
 
@@ -205,11 +253,10 @@ void* Loader::open(egl_connection_t* cnx)
     return (void*)hnd;
 }
 
-status_t Loader::close(void* driver)
+void Loader::close(void* driver)
 {
     driver_t* hnd = (driver_t*)driver;
     delete hnd;
-    return NO_ERROR;
 }
 
 void Loader::init_api(void* dso,
@@ -217,6 +264,8 @@ void Loader::init_api(void* dso,
         __eglMustCastToProperFunctionPointerType* curr,
         getProcAddressType getProcAddress)
 {
+    ATRACE_CALL();
+
     const ssize_t SIZE = 256;
     char scrap[SIZE];
     while (*api) {
@@ -268,15 +317,35 @@ void Loader::init_api(void* dso,
     }
 }
 
-void *Loader::load_driver(const char* kind,
-        egl_connection_t* cnx, uint32_t mask)
-{
+static void* load_system_driver(const char* kind) {
+    ATRACE_CALL();
     class MatchFile {
     public:
-        static String8 find(const char* kind) {
-            String8 result;
-            String8 pattern;
-            pattern.appendFormat("lib%s", kind);
+        static std::string find(const char* kind) {
+            std::string result;
+            int emulationStatus = checkGlesEmulationStatus();
+            switch (emulationStatus) {
+                case 0:
+#if defined(__LP64__)
+                    result = "/vendor/lib64/egl/libGLES_android.so";
+#else
+                    result = "/vendor/lib/egl/libGLES_android.so";
+#endif
+                    return result;
+                case 1:
+                    // Use host-side OpenGL through the "emulation" library
+#if defined(__LP64__)
+                    result = std::string("/vendor/lib64/egl/lib") + kind + "_emulation.so";
+#else
+                    result = std::string("/vendor/lib/egl/lib") + kind + "_emulation.so";
+#endif
+                    return result;
+                default:
+                    // Not in emulator, or use other guest-side implementation
+                    break;
+            }
+
+            std::string pattern = std::string("lib") + kind;
             const char* const searchPaths[] = {
 #if defined(__LP64__)
                     "/vendor/lib64/egl",
@@ -317,26 +386,11 @@ void *Loader::load_driver(const char* kind,
         }
 
     private:
-        static bool find(String8& result,
-                const String8& pattern, const char* const search, bool exact) {
-
-            // in the emulator case, we just return the hardcoded name
-            // of the software renderer.
-            if (checkGlesEmulationStatus() == 0) {
-                ALOGD("Emulator without GPU support detected. "
-                      "Fallback to software renderer.");
-#if defined(__LP64__)
-                result.setTo("/system/lib64/egl/libGLES_android.so");
-#else
-                result.setTo("/system/lib/egl/libGLES_android.so");
-#endif
-                return true;
-            }
-
+        static bool find(std::string& result,
+                const std::string& pattern, const char* const search, bool exact) {
             if (exact) {
-                String8 absolutePath;
-                absolutePath.appendFormat("%s/%s.so", search, pattern.string());
-                if (!access(absolutePath.string(), R_OK)) {
+                std::string absolutePath = std::string(search) + "/" + pattern;
+                if (!access(absolutePath.c_str(), R_OK)) {
                     result = absolutePath;
                     return true;
                 }
@@ -355,10 +409,9 @@ void *Loader::load_driver(const char* kind,
                         // always skip the software renderer
                         continue;
                     }
-                    if (strstr(e->d_name, pattern.string()) == e->d_name) {
+                    if (strstr(e->d_name, pattern.c_str()) == e->d_name) {
                         if (!strcmp(e->d_name + strlen(e->d_name) - 3, ".so")) {
-                            result.clear();
-                            result.appendFormat("%s/%s", search, e->d_name);
+                            result = std::string(search) + "/" + e->d_name;
                             closedir(d);
                             return true;
                         }
@@ -371,27 +424,78 @@ void *Loader::load_driver(const char* kind,
     };
 
 
-    String8 absolutePath = MatchFile::find(kind);
-    if (absolutePath.isEmpty()) {
+    std::string absolutePath = MatchFile::find(kind);
+    if (absolutePath.empty()) {
         // this happens often, we don't want to log an error
         return 0;
     }
-    const char* const driver_absolute_path = absolutePath.string();
+    const char* const driver_absolute_path = absolutePath.c_str();
 
-    void* dso = dlopen(driver_absolute_path, RTLD_NOW | RTLD_LOCAL);
+    // Try to load drivers from the 'sphal' namespace, if it exist. Fall back to
+    // the original routine when the namespace does not exist.
+    // See /system/core/rootdir/etc/ld.config.txt for the configuration of the
+    // sphal namespace.
+    void* dso = do_android_load_sphal_library(driver_absolute_path,
+                                              RTLD_NOW | RTLD_LOCAL);
     if (dso == 0) {
         const char* err = dlerror();
-        ALOGE("load_driver(%s): %s", driver_absolute_path, err?err:"unknown");
+        ALOGE("load_driver(%s): %s", driver_absolute_path, err ? err : "unknown");
         return 0;
     }
 
     ALOGD("loaded %s", driver_absolute_path);
 
+    return dso;
+}
+
+static const char* HAL_SUBNAME_KEY_PROPERTIES[2] = {
+    "ro.hardware.egl",
+    "ro.board.platform",
+};
+
+static void* load_updated_driver(const char* kind, android_namespace_t* ns) {
+    ATRACE_CALL();
+    const android_dlextinfo dlextinfo = {
+        .flags = ANDROID_DLEXT_USE_NAMESPACE,
+        .library_namespace = ns,
+    };
+    void* so = nullptr;
+    char prop[PROPERTY_VALUE_MAX + 1];
+    for (auto key : HAL_SUBNAME_KEY_PROPERTIES) {
+        if (property_get(key, prop, nullptr) > 0) {
+            std::string name = std::string("lib") + kind + "_" + prop + ".so";
+            so = do_android_dlopen_ext(name.c_str(), RTLD_LOCAL | RTLD_NOW, &dlextinfo);
+            if (so) {
+                return so;
+            }
+        }
+    }
+    return nullptr;
+}
+
+void *Loader::load_driver(const char* kind,
+        egl_connection_t* cnx, uint32_t mask)
+{
+    ATRACE_CALL();
+
+    void* dso = nullptr;
+#ifndef __ANDROID_VNDK__
+    android_namespace_t* ns = android_getDriverNamespace();
+    if (ns) {
+        dso = load_updated_driver(kind, ns);
+    }
+#endif
+    if (!dso) {
+        dso = load_system_driver(kind);
+        if (!dso)
+            return NULL;
+    }
+
     if (mask & EGL) {
         getProcAddress = (getProcAddressType)dlsym(dso, "eglGetProcAddress");
 
         ALOGE_IF(!getProcAddress,
-                "can't find eglGetProcAddress() in %s", driver_absolute_path);
+                "can't find eglGetProcAddress() in EGL driver library");
 
         egl_t* egl = &cnx->egl;
         __eglMustCastToProperFunctionPointerType* curr =

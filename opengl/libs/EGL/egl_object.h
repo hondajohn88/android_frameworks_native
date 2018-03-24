@@ -17,19 +17,19 @@
 #ifndef ANDROID_EGL_OBJECT_H
 #define ANDROID_EGL_OBJECT_H
 
-
-#include <ctype.h>
+#include <atomic>
 #include <stdint.h>
-#include <stdlib.h>
+#include <stddef.h>
+
+#include <string>
+#include <vector>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
-#include <utils/threads.h>
-#include <utils/String8.h>
-#include <utils/Vector.h>
-
 #include <system/window.h>
+
+#include <log/log.h>
 
 #include "egl_display.h"
 
@@ -37,33 +37,33 @@
 namespace android {
 // ----------------------------------------------------------------------------
 
-struct egl_display_t;
+class egl_display_t;
 
 class egl_object_t {
     egl_display_t *display;
-    mutable volatile int32_t count;
+    mutable std::atomic_size_t count;
 
 protected:
     virtual ~egl_object_t();
+    virtual void terminate();
 
 public:
-    egl_object_t(egl_display_t* display);
+    explicit egl_object_t(egl_display_t* display);
     void destroy();
 
-    inline int32_t incRef() { return android_atomic_inc(&count); }
-    inline int32_t decRef() { return android_atomic_dec(&count); }
+    inline void incRef() { count.fetch_add(1, std::memory_order_relaxed); }
+    inline size_t decRef() { return count.fetch_sub(1, std::memory_order_acq_rel); }
     inline egl_display_t* getDisplay() const { return display; }
 
 private:
-    void terminate();
     static bool get(egl_display_t const* display, egl_object_t* object);
 
 public:
     template <typename N, typename T>
     class LocalRef {
         egl_object_t* ref;
-        LocalRef();
-        LocalRef(const LocalRef* rhs);
+        LocalRef() = delete;
+        LocalRef(const LocalRef* rhs) = delete;
     public:
         ~LocalRef();
         explicit LocalRef(egl_object_t* rhs);
@@ -127,17 +127,29 @@ void egl_object_t::LocalRef<N,T>::terminate() {
 class egl_surface_t : public egl_object_t {
 protected:
     ~egl_surface_t();
+    void terminate() override;
 public:
     typedef egl_object_t::LocalRef<egl_surface_t, EGLSurface> Ref;
 
-    egl_surface_t(egl_display_t* dpy, EGLConfig config,
-            EGLNativeWindowType win, EGLSurface surface,
-            egl_connection_t const* cnx);
+    egl_surface_t(egl_display_t* dpy, EGLConfig config, EGLNativeWindowType win, EGLSurface surface,
+                  EGLint colorSpace, egl_connection_t const* cnx);
 
+    ANativeWindow* getNativeWindow() { return win; }
+    ANativeWindow* getNativeWindow() const { return win; }
+    EGLint getColorSpace() const { return colorSpace; }
+
+    // Try to keep the order of these fields and size unchanged. It's not public API, but
+    // it's not hard to imagine native games accessing them.
     EGLSurface surface;
     EGLConfig config;
-    sp<ANativeWindow> win;
+private:
+    ANativeWindow* win;
+public:
     egl_connection_t const* cnx;
+private:
+    bool connected;
+    void disconnect();
+    EGLint colorSpace;
 };
 
 class egl_context_t: public egl_object_t {
@@ -159,8 +171,8 @@ public:
     EGLSurface draw;
     egl_connection_t const* cnx;
     int version;
-    String8 gl_extensions;
-    Vector<String8> tokenized_gl_extensions;
+    std::string gl_extensions;
+    std::vector<std::string> tokenized_gl_extensions;
 };
 
 // ----------------------------------------------------------------------------

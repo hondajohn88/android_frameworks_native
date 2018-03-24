@@ -1,21 +1,22 @@
 LOCAL_PATH:= $(call my-dir)
+
+# =======================#
+# dumpstate_test_fixture #
+# =======================#
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := libdumpstate_default.c
-LOCAL_MODULE := libdumpstate.default
-include $(BUILD_STATIC_LIBRARY)
 
-include $(CLEAR_VARS)
+LOCAL_MODULE := dumpstate_test_fixture
+LOCAL_COMPATIBILITY_SUITE := device-tests
+LOCAL_MODULE_TAGS := tests
 
-ifdef BOARD_WLAN_DEVICE
-LOCAL_CFLAGS := -DFWDUMP_$(BOARD_WLAN_DEVICE)
-endif
+LOCAL_CFLAGS := \
+       -Wall -Werror -Wno-missing-field-initializers -Wno-unused-variable -Wunused-parameter
 
-LOCAL_SRC_FILES := dumpstate.c utils.c
+LOCAL_ADDITIONAL_DEPENDENCIES := $(LOCAL_PATH)/Android.mk
 
-LOCAL_MODULE := dumpstate
+LOCAL_SRC_FILES := \
+        tests/dumpstate_test_fixture.cpp
 
-LOCAL_SHARED_LIBRARIES := libcutils liblog libselinux
-LOCAL_HAL_STATIC_LIBRARIES := libdumpstate
-LOCAL_CFLAGS += -Wall -Wno-unused-parameter -std=gnu99
+LOCAL_TEST_DATA := $(call find-test-data-in-subdirs, $(LOCAL_PATH), *, tests/testdata)
 
-include $(BUILD_EXECUTABLE)
+include $(BUILD_NATIVE_TEST)

@@ -21,16 +21,20 @@
 #include "PointerControllerInterface.h"
 #include "InputListener.h"
 
+#include <input/DisplayViewport.h>
 #include <input/Input.h>
 #include <input/VelocityControl.h>
 #include <input/VelocityTracker.h>
 #include <ui/DisplayInfo.h>
 #include <utils/KeyedVector.h>
-#include <utils/threads.h>
+#include <utils/Condition.h>
+#include <utils/Thread.h>
+#include <utils/Mutex.h>
 #include <utils/Timers.h>
 #include <utils/RefBase.h>
 #include <utils/String8.h>
 #include <utils/BitSet.h>
+#include <utils/SortedVector.h>
 
 #include <stddef.h>
 #include <unistd.h>
@@ -47,70 +51,6 @@ namespace android {
 
 class InputDevice;
 class InputMapper;
-
-/*
- * Describes how coordinates are mapped on a physical display.
- * See com.android.server.display.DisplayViewport.
- */
-struct DisplayViewport {
-    int32_t displayId; // -1 if invalid
-    int32_t orientation;
-    int32_t logicalLeft;
-    int32_t logicalTop;
-    int32_t logicalRight;
-    int32_t logicalBottom;
-    int32_t physicalLeft;
-    int32_t physicalTop;
-    int32_t physicalRight;
-    int32_t physicalBottom;
-    int32_t deviceWidth;
-    int32_t deviceHeight;
-
-    DisplayViewport() :
-            displayId(ADISPLAY_ID_NONE), orientation(DISPLAY_ORIENTATION_0),
-            logicalLeft(0), logicalTop(0), logicalRight(0), logicalBottom(0),
-            physicalLeft(0), physicalTop(0), physicalRight(0), physicalBottom(0),
-            deviceWidth(0), deviceHeight(0) {
-    }
-
-    bool operator==(const DisplayViewport& other) const {
-        return displayId == other.displayId
-                && orientation == other.orientation
-                && logicalLeft == other.logicalLeft
-                && logicalTop == other.logicalTop
-                && logicalRight == other.logicalRight
-                && logicalBottom == other.logicalBottom
-                && physicalLeft == other.physicalLeft
-                && physicalTop == other.physicalTop
-                && physicalRight == other.physicalRight
-                && physicalBottom == other.physicalBottom
-                && deviceWidth == other.deviceWidth
-                && deviceHeight == other.deviceHeight;
-    }
-
-    bool operator!=(const DisplayViewport& other) const {
-        return !(*this == other);
-    }
-
-    inline bool isValid() const {
-        return displayId >= 0;
-    }
-
-    void setNonDisplayViewport(int32_t width, int32_t height) {
-        displayId = ADISPLAY_ID_NONE;
-        orientation = DISPLAY_ORIENTATION_0;
-        logicalLeft = 0;
-        logicalTop = 0;
-        logicalRight = width;
-        logicalBottom = height;
-        physicalLeft = 0;
-        physicalTop = 0;
-        physicalRight = width;
-        physicalBottom = height;
-        deviceWidth = width;
-        deviceHeight = height;
-    }
-};
 
 /*
  * Input reader configuration.
@@ -143,6 +83,12 @@ struct InputReaderConfiguration {
 
         // The presence of an external stylus has changed.
         CHANGE_EXTERNAL_STYLUS_PRESENCE = 1 << 7,
+
+        // The pointer capture mode has changed.
+        CHANGE_POINTER_CAPTURE = 1 << 8,
+
+        // The set of disabled input devices (disabledDevices) has changed.
+        CHANGE_ENABLED_STATE = 1 << 9,
 
         // All devices must be reopened.
         CHANGE_MUST_REOPEN = 1 << 31,
@@ -231,6 +177,12 @@ struct InputReaderConfiguration {
     // True to show the location of touches on the touch screen as spots.
     bool showTouches;
 
+    // True if pointer capture is enabled.
+    bool pointerCapture;
+
+    // The set of currently disabled input devices.
+    SortedVector<int32_t> disabledDevices;
+
     InputReaderConfiguration() :
             virtualKeyQuietTime(0),
             pointerVelocityControlParameters(1.0f, 500.0f, 3000.0f, 3.0f),
@@ -249,12 +201,19 @@ struct InputReaderConfiguration {
             pointerGestureZoomSpeedRatio(0.3f),
             showTouches(false) { }
 
-    bool getDisplayInfo(bool external, DisplayViewport* outViewport) const;
-    void setDisplayInfo(bool external, const DisplayViewport& viewport);
+    bool getDisplayViewport(ViewportType viewportType, const String8* displayId,
+            DisplayViewport* outViewport) const;
+    void setPhysicalDisplayViewport(ViewportType viewportType, const DisplayViewport& viewport);
+    void setVirtualDisplayViewports(const Vector<DisplayViewport>& viewports);
+
+
+    void dump(String8& dump) const;
+    void dumpViewport(String8& dump, const DisplayViewport& viewport) const;
 
 private:
     DisplayViewport mInternalDisplay;
     DisplayViewport mExternalDisplay;
+    Vector<DisplayViewport> mVirtualDisplays;
 };
 
 
@@ -338,6 +297,9 @@ public:
     /* Called by the heatbeat to ensures that the reader has not deadlocked. */
     virtual void monitor() = 0;
 
+    /* Returns true if the input device is enabled. */
+    virtual bool isInputDeviceEnabled(int32_t deviceId) = 0;
+
     /* Runs a single iteration of the processing loop.
      * Nominally reads and processes one incoming message from the EventHub.
      *
@@ -358,6 +320,9 @@ public:
             int32_t keyCode) = 0;
     virtual int32_t getSwitchState(int32_t deviceId, uint32_t sourceMask,
             int32_t sw) = 0;
+
+    /* Toggle Caps Lock */
+    virtual void toggleCapsLockState(int32_t deviceId) = 0;
 
     /* Determine whether physical keys exist for the given framework-domain key codes. */
     virtual bool hasKeys(int32_t deviceId, uint32_t sourceMask,
@@ -454,12 +419,16 @@ public:
 
     virtual void getInputDevices(Vector<InputDeviceInfo>& outInputDevices);
 
+    virtual bool isInputDeviceEnabled(int32_t deviceId);
+
     virtual int32_t getScanCodeState(int32_t deviceId, uint32_t sourceMask,
             int32_t scanCode);
     virtual int32_t getKeyCodeState(int32_t deviceId, uint32_t sourceMask,
             int32_t keyCode);
     virtual int32_t getSwitchState(int32_t deviceId, uint32_t sourceMask,
             int32_t sw);
+
+    virtual void toggleCapsLockState(int32_t deviceId);
 
     virtual bool hasKeys(int32_t deviceId, uint32_t sourceMask,
             size_t numCodes, const int32_t* keyCodes, uint8_t* outFlags);
@@ -479,7 +448,7 @@ protected:
         InputReader* mReader;
 
     public:
-        ContextImpl(InputReader* reader);
+        explicit ContextImpl(InputReader* reader);
 
         virtual void updateGlobalMetaState();
         virtual int32_t getGlobalMetaState();
@@ -563,7 +532,7 @@ private:
 /* Reads raw events from the event hub and processes them, endlessly. */
 class InputReaderThread : public Thread {
 public:
-    InputReaderThread(const sp<InputReaderInterface>& reader);
+    explicit InputReaderThread(const sp<InputReaderInterface>& reader);
     virtual ~InputReaderThread();
 
 private:
@@ -597,6 +566,9 @@ public:
 
     inline bool isIgnored() { return mMappers.isEmpty(); }
 
+    bool isEnabled();
+    void setEnabled(bool enabled, nsecs_t when);
+
     void dump(String8& dump);
     void addMapper(InputMapper* mapper);
     void configure(nsecs_t when, const InputReaderConfiguration* config, uint32_t changes);
@@ -616,6 +588,7 @@ public:
     void cancelTouch(nsecs_t when);
 
     int32_t getMetaState();
+    void updateMetaState(int32_t keyCode);
 
     void fadePointer();
 
@@ -1001,7 +974,7 @@ private:
  */
 class InputMapper {
 public:
-    InputMapper(InputDevice* device);
+    explicit InputMapper(InputDevice* device);
     virtual ~InputMapper();
 
     inline InputDevice* getDevice() { return mDevice; }
@@ -1031,6 +1004,7 @@ public:
     virtual void cancelTouch(nsecs_t when);
 
     virtual int32_t getMetaState();
+    virtual void updateMetaState(int32_t keyCode);
 
     virtual void updateExternalStylusState(const StylusState& state);
 
@@ -1051,7 +1025,7 @@ protected:
 
 class SwitchInputMapper : public InputMapper {
 public:
-    SwitchInputMapper(InputDevice* device);
+    explicit SwitchInputMapper(InputDevice* device);
     virtual ~SwitchInputMapper();
 
     virtual uint32_t getSources();
@@ -1071,7 +1045,7 @@ private:
 
 class VibratorInputMapper : public InputMapper {
 public:
-    VibratorInputMapper(InputDevice* device);
+    explicit VibratorInputMapper(InputDevice* device);
     virtual ~VibratorInputMapper();
 
     virtual uint32_t getSources();
@@ -1116,6 +1090,7 @@ public:
             const int32_t* keyCodes, uint8_t* outFlags);
 
     virtual int32_t getMetaState();
+    virtual void updateMetaState(int32_t keyCode);
 
 private:
     struct KeyDown {
@@ -1153,8 +1128,11 @@ private:
     void dumpParameters(String8& dump);
 
     bool isKeyboardOrGamepadKey(int32_t scanCode);
+    bool isMediaKey(int32_t keyCode);
 
     void processKey(nsecs_t when, bool down, int32_t scanCode, int32_t usageCode);
+
+    bool updateMetaStateIfNeeded(int32_t keyCode, bool down);
 
     ssize_t findKeyDown(int32_t scanCode);
 
@@ -1168,7 +1146,7 @@ private:
 
 class CursorInputMapper : public InputMapper {
 public:
-    CursorInputMapper(InputDevice* device);
+    explicit CursorInputMapper(InputDevice* device);
     virtual ~CursorInputMapper();
 
     virtual uint32_t getSources();
@@ -1190,6 +1168,7 @@ private:
     struct Parameters {
         enum Mode {
             MODE_POINTER,
+            MODE_POINTER_RELATIVE,
             MODE_NAVIGATION,
         };
 
@@ -1231,9 +1210,31 @@ private:
 };
 
 
+class RotaryEncoderInputMapper : public InputMapper {
+public:
+    explicit RotaryEncoderInputMapper(InputDevice* device);
+    virtual ~RotaryEncoderInputMapper();
+
+    virtual uint32_t getSources();
+    virtual void populateDeviceInfo(InputDeviceInfo* deviceInfo);
+    virtual void dump(String8& dump);
+    virtual void configure(nsecs_t when, const InputReaderConfiguration* config, uint32_t changes);
+    virtual void reset(nsecs_t when);
+    virtual void process(const RawEvent* rawEvent);
+
+private:
+    CursorScrollAccumulator mRotaryEncoderScrollAccumulator;
+
+    int32_t mSource;
+    float mScalingFactor;
+    int32_t mOrientation;
+
+    void sync(nsecs_t when);
+};
+
 class TouchInputMapper : public InputMapper {
 public:
-    TouchInputMapper(InputDevice* device);
+    explicit TouchInputMapper(InputDevice* device);
     virtual ~TouchInputMapper();
 
     virtual uint32_t getSources();
@@ -1303,10 +1304,11 @@ protected:
         bool associatedDisplayIsExternal;
         bool orientationAware;
         bool hasButtonUnderPad;
+        String8 uniqueDisplayId;
 
         enum GestureMode {
-            GESTURE_MODE_POINTER,
-            GESTURE_MODE_SPOTS,
+            GESTURE_MODE_SINGLE_TOUCH,
+            GESTURE_MODE_MULTI_TOUCH,
         };
         GestureMode gestureMode;
 
@@ -1851,12 +1853,14 @@ private:
     const VirtualKey* findVirtualKeyHit(int32_t x, int32_t y);
 
     static void assignPointerIds(const RawState* last, RawState* current);
+
+    const char* modeToString(DeviceMode deviceMode);
 };
 
 
 class SingleTouchInputMapper : public TouchInputMapper {
 public:
-    SingleTouchInputMapper(InputDevice* device);
+    explicit SingleTouchInputMapper(InputDevice* device);
     virtual ~SingleTouchInputMapper();
 
     virtual void reset(nsecs_t when);
@@ -1874,7 +1878,7 @@ private:
 
 class MultiTouchInputMapper : public TouchInputMapper {
 public:
-    MultiTouchInputMapper(InputDevice* device);
+    explicit MultiTouchInputMapper(InputDevice* device);
     virtual ~MultiTouchInputMapper();
 
     virtual void reset(nsecs_t when);
@@ -1895,7 +1899,7 @@ private:
 
 class ExternalStylusInputMapper : public InputMapper {
 public:
-    ExternalStylusInputMapper(InputDevice* device);
+    explicit ExternalStylusInputMapper(InputDevice* device);
     virtual ~ExternalStylusInputMapper() = default;
 
     virtual uint32_t getSources();
@@ -1917,7 +1921,7 @@ private:
 
 class JoystickInputMapper : public InputMapper {
 public:
-    JoystickInputMapper(InputDevice* device);
+    explicit JoystickInputMapper(InputDevice* device);
     virtual ~JoystickInputMapper();
 
     virtual uint32_t getSources();

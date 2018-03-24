@@ -14,19 +14,10 @@
  ** limitations under the License.
  */
 
-#include <string>
+#include "egl_object.h"
+
 #include <sstream>
 
-#include <ctype.h>
-#include <stdint.h>
-#include <stdlib.h>
-
-#include <EGL/egl.h>
-#include <EGL/eglext.h>
-
-#include <utils/threads.h>
-
-#include "egl_object.h"
 
 // ----------------------------------------------------------------------------
 namespace android {
@@ -64,25 +55,40 @@ bool egl_object_t::get(egl_display_t const* display, egl_object_t* object) {
 
 // ----------------------------------------------------------------------------
 
-egl_surface_t::egl_surface_t(egl_display_t* dpy, EGLConfig config,
-        EGLNativeWindowType win, EGLSurface surface,
-        egl_connection_t const* cnx) :
-    egl_object_t(dpy), surface(surface), config(config), win(win), cnx(cnx)
-{
+egl_surface_t::egl_surface_t(egl_display_t* dpy, EGLConfig config, EGLNativeWindowType win,
+                             EGLSurface surface, EGLint colorSpace, egl_connection_t const* cnx)
+      : egl_object_t(dpy),
+        surface(surface),
+        config(config),
+        win(win),
+        cnx(cnx),
+        connected(true),
+        colorSpace(colorSpace) {
     if (win) {
-        getDisplay()->onWindowSurfaceCreated();
+        win->incStrong(this);
     }
 }
 
 egl_surface_t::~egl_surface_t() {
-    ANativeWindow* const window = win.get();
-    if (window != NULL) {
-        native_window_set_buffers_format(window, 0);
-        if (native_window_api_disconnect(window, NATIVE_WINDOW_API_EGL)) {
-            ALOGW("EGLNativeWindowType %p disconnect failed", window);
-        }
-        getDisplay()->onWindowSurfaceDestroyed();
+    if (win != NULL) {
+        disconnect();
+        win->decStrong(this);
     }
+}
+
+void egl_surface_t::disconnect() {
+    if (win != NULL && connected) {
+        native_window_set_buffers_format(win, 0);
+        if (native_window_api_disconnect(win, NATIVE_WINDOW_API_EGL)) {
+            ALOGW("EGLNativeWindowType %p disconnect failed", win);
+        }
+        connected = false;
+    }
+}
+
+void egl_surface_t::terminate() {
+    disconnect();
+    egl_object_t::terminate();
 }
 
 // ----------------------------------------------------------------------------
@@ -107,22 +113,20 @@ void egl_context_t::onMakeCurrent(EGLSurface draw, EGLSurface read) {
      * add the extensions always handled by the wrapper
      */
 
-    if (gl_extensions.isEmpty()) {
+    if (gl_extensions.empty()) {
         // call the implementation's glGetString(GL_EXTENSIONS)
         const char* exts = (const char *)gEGLImpl.hooks[version]->gl.glGetString(GL_EXTENSIONS);
-        gl_extensions.setTo(exts);
-        if (gl_extensions.find("GL_EXT_debug_marker") < 0) {
-            String8 temp("GL_EXT_debug_marker ");
-            temp.append(gl_extensions);
-            gl_extensions.setTo(temp);
+        gl_extensions = exts;
+        if (gl_extensions.find("GL_EXT_debug_marker") == std::string::npos) {
+            gl_extensions.insert(0, "GL_EXT_debug_marker ");
         }
 
         // tokenize the supported extensions for the glGetStringi() wrapper
         std::stringstream ss;
         std::string str;
-        ss << gl_extensions.string();
+        ss << gl_extensions;
         while (ss >> str) {
-            tokenized_gl_extensions.push(String8(str.c_str()));
+            tokenized_gl_extensions.push_back(str);
         }
     }
 }

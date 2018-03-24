@@ -18,10 +18,12 @@
 //#define LOG_NDEBUG 0
 
 #include "SurfaceFlingerConsumer.h"
+#include "Layer.h"
 
 #include <private/gui/SyncFeatures.h>
 
 #include <gui/BufferItem.h>
+#include <gui/BufferQueue.h>
 
 #include <utils/Errors.h>
 #include <utils/NativeHandle.h>
@@ -32,7 +34,8 @@ namespace android {
 // ---------------------------------------------------------------------------
 
 status_t SurfaceFlingerConsumer::updateTexImage(BufferRejecter* rejecter,
-        const DispSync& dispSync, uint64_t maxFrameNumber)
+        const DispSync& dispSync, bool* autoRefresh, bool* queuedBuffer,
+        uint64_t maxFrameNumber)
 {
     ATRACE_CALL();
     ALOGV("updateTexImage");
@@ -68,18 +71,29 @@ status_t SurfaceFlingerConsumer::updateTexImage(BufferRejecter* rejecter,
         return err;
     }
 
+    if (autoRefresh) {
+        *autoRefresh = item.mAutoRefresh;
+    }
+
+    if (queuedBuffer) {
+        *queuedBuffer = item.mQueuedBuffer;
+    }
 
     // We call the rejecter here, in case the caller has a reason to
     // not accept this buffer.  This is used by SurfaceFlinger to
     // reject buffers which have the wrong size
-    int buf = item.mBuf;
-    if (rejecter && rejecter->reject(mSlots[buf].mGraphicBuffer, item)) {
-        releaseBufferLocked(buf, mSlots[buf].mGraphicBuffer, EGL_NO_SYNC_KHR);
+    int slot = item.mSlot;
+    if (rejecter && rejecter->reject(mSlots[slot].mGraphicBuffer, item)) {
+        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer, EGL_NO_SYNC_KHR);
         return BUFFER_REJECTED;
     }
 
     // Release the previous buffer.
+#ifdef USE_HWC2
+    err = updateAndReleaseLocked(item, &mPendingRelease);
+#else
     err = updateAndReleaseLocked(item);
+#endif
     if (err != NO_ERROR) {
         return err;
     }
@@ -116,6 +130,7 @@ status_t SurfaceFlingerConsumer::acquireBufferLocked(BufferItem* item,
 }
 
 bool SurfaceFlingerConsumer::getTransformToDisplayInverse() const {
+    Mutex::Autolock lock(mMutex);
     return mTransformToDisplayInverse;
 }
 
@@ -124,7 +139,9 @@ const Region& SurfaceFlingerConsumer::getSurfaceDamage() const {
 }
 
 sp<NativeHandle> SurfaceFlingerConsumer::getSidebandStream() const {
-    return mConsumer->getSidebandStream();
+    sp<NativeHandle> stream;
+    mConsumer->getSidebandStream(&stream);
+    return stream;
 }
 
 // We need to determine the time when a buffer acquired now will be
@@ -164,16 +181,56 @@ nsecs_t SurfaceFlingerConsumer::computeExpectedPresent(const DispSync& dispSync)
     const nsecs_t nextRefresh = dispSync.computeNextRefresh(hwcLatency);
 
     // The DispSync time is already adjusted for the difference between
-    // vsync and reported-vsync (PRESENT_TIME_OFFSET_FROM_VSYNC_NS), so
+    // vsync and reported-vsync (SurfaceFlinger::dispSyncPresentTimeOffset), so
     // we don't need to factor that in here.  Pad a little to avoid
     // weird effects if apps might be requesting times right on the edge.
     nsecs_t extraPadding = 0;
-    if (VSYNC_EVENT_PHASE_OFFSET_NS == 0) {
+    if (SurfaceFlinger::vsyncPhaseOffsetNs == 0) {
         extraPadding = 1000000;        // 1ms (6% of 60Hz)
     }
 
     return nextRefresh + extraPadding;
 }
+
+sp<Fence> SurfaceFlingerConsumer::getPrevFinalReleaseFence() const {
+    Mutex::Autolock lock(mMutex);
+    return ConsumerBase::mPrevFinalReleaseFence;
+}
+
+#ifdef USE_HWC2
+void SurfaceFlingerConsumer::setReleaseFence(const sp<Fence>& fence)
+{
+    if (!mPendingRelease.isPending) {
+        GLConsumer::setReleaseFence(fence);
+        return;
+    }
+    auto currentTexture = mPendingRelease.currentTexture;
+    if (fence->isValid() &&
+            currentTexture != BufferQueue::INVALID_BUFFER_SLOT) {
+        status_t result = addReleaseFence(currentTexture,
+                mPendingRelease.graphicBuffer, fence);
+        ALOGE_IF(result != NO_ERROR, "setReleaseFence: failed to add the"
+                " fence: %s (%d)", strerror(-result), result);
+    }
+}
+
+bool SurfaceFlingerConsumer::releasePendingBuffer()
+{
+    if (!mPendingRelease.isPending) {
+        ALOGV("Pending buffer already released");
+        return false;
+    }
+    ALOGV("Releasing pending buffer");
+    Mutex::Autolock lock(mMutex);
+    status_t result = releaseBufferLocked(mPendingRelease.currentTexture,
+            mPendingRelease.graphicBuffer, mPendingRelease.display,
+            mPendingRelease.fence);
+    ALOGE_IF(result < NO_ERROR, "releasePendingBuffer failed: %s (%d)",
+            strerror(-result), result);
+    mPendingRelease = PendingRelease();
+    return true;
+}
+#endif
 
 void SurfaceFlingerConsumer::setContentsChangedListener(
         const wp<ContentsChangedListener>& listener) {
@@ -183,15 +240,36 @@ void SurfaceFlingerConsumer::setContentsChangedListener(
 }
 
 void SurfaceFlingerConsumer::onSidebandStreamChanged() {
+    FrameAvailableListener* unsafeFrameAvailableListener = nullptr;
+    {
+        Mutex::Autolock lock(mFrameAvailableMutex);
+        unsafeFrameAvailableListener = mFrameAvailableListener.unsafe_get();
+    }
     sp<ContentsChangedListener> listener;
     {   // scope for the lock
         Mutex::Autolock lock(mMutex);
-        ALOG_ASSERT(mFrameAvailableListener.unsafe_get() == mContentsChangedListener.unsafe_get());
+        ALOG_ASSERT(unsafeFrameAvailableListener == mContentsChangedListener.unsafe_get());
         listener = mContentsChangedListener.promote();
     }
 
     if (listener != NULL) {
         listener->onSidebandStreamChanged();
+    }
+}
+
+void SurfaceFlingerConsumer::onDisconnect() {
+    sp<Layer> l = mLayer.promote();
+    if (l.get()) {
+        l->onDisconnect();
+    }
+}
+
+void SurfaceFlingerConsumer::addAndGetFrameTimestamps(
+        const NewFrameEventsEntry* newTimestamps,
+        FrameEventHistoryDelta *outDelta) {
+    sp<Layer> l = mLayer.promote();
+    if (l.get()) {
+        l->addAndGetFrameTimestamps(newTimestamps, outDelta);
     }
 }
 

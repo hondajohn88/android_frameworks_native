@@ -45,16 +45,16 @@
 
 #include "InputDispatcher.h"
 
-#include <utils/Trace.h>
-#include <cutils/log.h>
-#include <powermanager/PowerManager.h>
-#include <ui/Region.h>
-
-#include <stddef.h>
-#include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <time.h>
+#include <unistd.h>
+
+#include <log/log.h>
+#include <utils/Trace.h>
+#include <powermanager/PowerManager.h>
+#include <ui/Region.h>
 
 #define INDENT "  "
 #define INDENT2 "    "
@@ -134,7 +134,7 @@ static bool isValidMotionAction(int32_t action, int32_t actionButton, int32_t po
     case AMOTION_EVENT_ACTION_POINTER_DOWN:
     case AMOTION_EVENT_ACTION_POINTER_UP: {
         int32_t index = getMotionEventActionPointerIndex(action);
-        return index >= 0 && size_t(index) < pointerCount;
+        return index >= 0 && index < pointerCount;
     }
     case AMOTION_EVENT_ACTION_BUTTON_PRESS:
     case AMOTION_EVENT_ACTION_BUTTON_RELEASE:
@@ -869,10 +869,7 @@ bool InputDispatcher::dispatchMotionLocked(
         return true;
     }
 
-    // TODO: support sending secondary display events to input monitors
-    if (isMainDisplay(entry->displayId)) {
-        addMonitoringTargetsLocked(inputTargets);
-    }
+    addMonitoringTargetsLocked(inputTargets);
 
     // Dispatch the motion.
     if (conflictingPointerActions) {
@@ -1172,10 +1169,11 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
     bool wrongDevice = false;
     if (newGesture) {
         bool down = maskedAction == AMOTION_EVENT_ACTION_DOWN;
-        if (switchedDevice && mTempTouchState.down && !down) {
+        if (switchedDevice && mTempTouchState.down && !down && !isHoverAction) {
 #if DEBUG_FOCUS
             ALOGD("Dropping event because a pointer for a different device is already down.");
 #endif
+            // TODO: test multiple simultaneous input streams.
             injectionResult = INPUT_EVENT_INJECTION_FAILED;
             switchedDevice = false;
             wrongDevice = true;
@@ -1187,6 +1185,15 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
         mTempTouchState.source = entry->source;
         mTempTouchState.displayId = displayId;
         isSplit = false;
+    } else if (switchedDevice && maskedAction == AMOTION_EVENT_ACTION_MOVE) {
+#if DEBUG_FOCUS
+        ALOGI("Dropping move event because a pointer for a different device is already active.");
+#endif
+        // TODO: test multiple simultaneous input streams.
+        injectionResult = INPUT_EVENT_INJECTION_PERMISSION_DENIED;
+        switchedDevice = false;
+        wrongDevice = true;
+        goto Failed;
     }
 
     if (newGesture || (isSplit && maskedAction == AMOTION_EVENT_ACTION_POINTER_DOWN)) {
@@ -1222,13 +1229,8 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
 
                 if (maskedAction == AMOTION_EVENT_ACTION_DOWN
                         && (flags & InputWindowInfo::FLAG_WATCH_OUTSIDE_TOUCH)) {
-                    int32_t outsideTargetFlags = InputTarget::FLAG_DISPATCH_AS_OUTSIDE;
-                    if (isWindowObscuredAtPointLocked(windowHandle, x, y)) {
-                        outsideTargetFlags |= InputTarget::FLAG_WINDOW_IS_OBSCURED;
-                    }
-
                     mTempTouchState.addOrUpdateWindow(
-                            windowHandle, outsideTargetFlags, BitSet32(0));
+                            windowHandle, InputTarget::FLAG_DISPATCH_AS_OUTSIDE, BitSet32(0));
                 }
             }
         }
@@ -1262,6 +1264,8 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
         }
         if (isWindowObscuredAtPointLocked(newTouchedWindowHandle, x, y)) {
             targetFlags |= InputTarget::FLAG_WINDOW_IS_OBSCURED;
+        } else if (isWindowObscuredLocked(newTouchedWindowHandle)) {
+            targetFlags |= InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED;
         }
 
         // Update hover state.
@@ -1437,6 +1441,7 @@ int32_t InputDispatcher::findTouchedWindowTargetsLocked(nsecs_t currentTime,
                                 == InputWindowInfo::TYPE_WALLPAPER) {
                     mTempTouchState.addOrUpdateWindow(windowHandle,
                             InputTarget::FLAG_WINDOW_IS_OBSCURED
+                                    | InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED
                                     | InputTarget::FLAG_DISPATCH_AS_IS,
                             BitSet32(0));
                 }
@@ -1625,6 +1630,27 @@ bool InputDispatcher::isWindowObscuredAtPointLocked(
         if (otherInfo->displayId == displayId
                 && otherInfo->visible && !otherInfo->isTrustedOverlay()
                 && otherInfo->frameContainsPoint(x, y)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+
+bool InputDispatcher::isWindowObscuredLocked(const sp<InputWindowHandle>& windowHandle) const {
+    int32_t displayId = windowHandle->getInfo()->displayId;
+    const InputWindowInfo* windowInfo = windowHandle->getInfo();
+    size_t numWindows = mWindowHandles.size();
+    for (size_t i = 0; i < numWindows; i++) {
+        sp<InputWindowHandle> otherHandle = mWindowHandles.itemAt(i);
+        if (otherHandle == windowHandle) {
+            break;
+        }
+
+        const InputWindowInfo* otherInfo = otherHandle->getInfo();
+        if (otherInfo->displayId == displayId
+                && otherInfo->visible && !otherInfo->isTrustedOverlay()
+                && otherInfo->overlaps(windowInfo)) {
             return true;
         }
     }
@@ -1905,6 +1931,9 @@ void InputDispatcher::enqueueDispatchEntryLocked(
         if (dispatchEntry->targetFlags & InputTarget::FLAG_WINDOW_IS_OBSCURED) {
             dispatchEntry->resolvedFlags |= AMOTION_EVENT_FLAG_WINDOW_IS_OBSCURED;
         }
+        if (dispatchEntry->targetFlags & InputTarget::FLAG_WINDOW_IS_PARTIALLY_OBSCURED) {
+            dispatchEntry->resolvedFlags |= AMOTION_EVENT_FLAG_WINDOW_IS_PARTIALLY_OBSCURED;
+        }
 
         if (!connection->inputState.trackMotion(motionEntry,
                 dispatchEntry->resolvedAction, dispatchEntry->resolvedFlags)) {
@@ -1994,7 +2023,7 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
 
             // Publish the motion event.
             status = connection->inputPublisher.publishMotionEvent(dispatchEntry->seq,
-                    motionEntry->deviceId, motionEntry->source,
+                    motionEntry->deviceId, motionEntry->source, motionEntry->displayId,
                     dispatchEntry->resolvedAction, motionEntry->actionButton,
                     dispatchEntry->resolvedFlags, motionEntry->edgeFlags,
                     motionEntry->metaState, motionEntry->buttonState,
@@ -2394,7 +2423,7 @@ void InputDispatcher::notifyKey(const NotifyKeyArgs* args) {
             struct KeyReplacement replacement = {keyCode, args->deviceId};
             mReplacedKeys.add(replacement, newKeyCode);
             keyCode = newKeyCode;
-            metaState &= ~AMETA_META_ON;
+            metaState &= ~(AMETA_META_ON | AMETA_META_LEFT_ON | AMETA_META_RIGHT_ON);
         }
     } else if (args->action == AKEY_EVENT_ACTION_UP) {
         // In order to maintain a consistent stream of up and down events, check to see if the key
@@ -2406,7 +2435,7 @@ void InputDispatcher::notifyKey(const NotifyKeyArgs* args) {
         if (index >= 0) {
             keyCode = mReplacedKeys.valueAt(index);
             mReplacedKeys.removeItemsAt(index);
-            metaState &= ~AMETA_META_ON;
+            metaState &= ~(AMETA_META_ON | AMETA_META_LEFT_ON | AMETA_META_RIGHT_ON);
         }
     }
 
@@ -2568,8 +2597,9 @@ int32_t InputDispatcher::injectInputEvent(const InputEvent* event, int32_t displ
         uint32_t policyFlags) {
 #if DEBUG_INBOUND_EVENT_DETAILS
     ALOGD("injectInputEvent - eventType=%d, injectorPid=%d, injectorUid=%d, "
-            "syncMode=%d, timeoutMillis=%d, policyFlags=0x%08x",
-            event->getType(), injectorPid, injectorUid, syncMode, timeoutMillis, policyFlags);
+            "syncMode=%d, timeoutMillis=%d, policyFlags=0x%08x, displayId=%d",
+            event->getType(), injectorPid, injectorUid, syncMode, timeoutMillis, policyFlags,
+            displayId);
 #endif
 
     nsecs_t endTime = now() + milliseconds_to_nanoseconds(timeoutMillis);

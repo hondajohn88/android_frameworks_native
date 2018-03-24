@@ -19,10 +19,12 @@
 //#define ATRACE_TAG ATRACE_TAG_GRAPHICS
 #include <utils/Log.h>
 
+#include <inttypes.h>
+
 #include <gui/BufferItem.h>
 #include <gui/BufferItemConsumer.h>
 
-//#define BI_LOGV(x, ...) ALOGV("[%s] " x, mName.string(), ##__VA_ARGS__)
+#define BI_LOGV(x, ...) ALOGV("[%s] " x, mName.string(), ##__VA_ARGS__)
 //#define BI_LOGD(x, ...) ALOGD("[%s] " x, mName.string(), ##__VA_ARGS__)
 //#define BI_LOGI(x, ...) ALOGI("[%s] " x, mName.string(), ##__VA_ARGS__)
 //#define BI_LOGW(x, ...) ALOGW("[%s] " x, mName.string(), ##__VA_ARGS__)
@@ -31,13 +33,13 @@
 namespace android {
 
 BufferItemConsumer::BufferItemConsumer(
-        const sp<IGraphicBufferConsumer>& consumer, uint32_t consumerUsage,
+        const sp<IGraphicBufferConsumer>& consumer, uint64_t consumerUsage,
         int bufferCount, bool controlledByApp) :
     ConsumerBase(consumer, controlledByApp)
 {
     status_t err = mConsumer->setConsumerUsageBits(consumerUsage);
     LOG_ALWAYS_FATAL_IF(err != OK,
-            "Failed to set consumer usage bits to %#x", consumerUsage);
+            "Failed to set consumer usage bits to %#" PRIx64, consumerUsage);
     if (bufferCount != DEFAULT_MAX_BUFFERS) {
         err = mConsumer->setMaxAcquiredBufferCount(bufferCount);
         LOG_ALWAYS_FATAL_IF(err != OK,
@@ -49,8 +51,18 @@ BufferItemConsumer::~BufferItemConsumer() {}
 
 void BufferItemConsumer::setName(const String8& name) {
     Mutex::Autolock _l(mMutex);
+    if (mAbandoned) {
+        BI_LOGE("setName: BufferItemConsumer is abandoned!");
+        return;
+    }
     mName = name;
     mConsumer->setConsumerName(name);
+}
+
+void BufferItemConsumer::setBufferFreedListener(
+        const wp<BufferFreedListener>& listener) {
+    Mutex::Autolock _l(mMutex);
+    mBufferFreedListener = listener;
 }
 
 status_t BufferItemConsumer::acquireBuffer(BufferItem *item,
@@ -78,7 +90,7 @@ status_t BufferItemConsumer::acquireBuffer(BufferItem *item,
         }
     }
 
-    item->mGraphicBuffer = mSlots[item->mBuf].mGraphicBuffer;
+    item->mGraphicBuffer = mSlots[item->mSlot].mGraphicBuffer;
 
     return OK;
 }
@@ -89,15 +101,25 @@ status_t BufferItemConsumer::releaseBuffer(const BufferItem &item,
 
     Mutex::Autolock _l(mMutex);
 
-    err = addReleaseFenceLocked(item.mBuf, item.mGraphicBuffer, releaseFence);
+    err = addReleaseFenceLocked(item.mSlot, item.mGraphicBuffer, releaseFence);
 
-    err = releaseBufferLocked(item.mBuf, item.mGraphicBuffer, EGL_NO_DISPLAY,
+    err = releaseBufferLocked(item.mSlot, item.mGraphicBuffer, EGL_NO_DISPLAY,
             EGL_NO_SYNC_KHR);
     if (err != OK) {
         BI_LOGE("Failed to release buffer: %s (%d)",
                 strerror(-err), err);
     }
     return err;
+}
+
+void BufferItemConsumer::freeBufferLocked(int slotIndex) {
+    sp<BufferFreedListener> listener = mBufferFreedListener.promote();
+    if (listener != NULL && mSlots[slotIndex].mGraphicBuffer != NULL) {
+        // Fire callback if we have a listener registered and the buffer being freed is valid.
+        BI_LOGV("actually calling onBufferFreed");
+        listener->onBufferFreed(mSlots[slotIndex].mGraphicBuffer);
+    }
+    ConsumerBase::freeBufferLocked(slotIndex);
 }
 
 } // namespace android

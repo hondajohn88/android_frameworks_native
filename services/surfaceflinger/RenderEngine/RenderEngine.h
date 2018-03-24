@@ -23,7 +23,7 @@
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <ui/mat4.h>
+#include <math/mat4.h>
 #include <Transform.h>
 
 #define EGL_NO_CONFIG ((EGLConfig)0)
@@ -59,9 +59,14 @@ protected:
     virtual ~RenderEngine() = 0;
 
 public:
-    static RenderEngine* create(EGLDisplay display, int hwcFormat);
+    enum FeatureFlag {
+        WIDE_COLOR_SUPPORT = 1 << 0 // Platform has a wide color display
+    };
+    static RenderEngine* create(EGLDisplay display, int hwcFormat, uint32_t featureFlags);
 
-    static EGLConfig chooseEglConfig(EGLDisplay display, int format);
+    static EGLConfig chooseEglConfig(EGLDisplay display, int format, bool logConfig);
+
+    void primeCache() const;
 
     // dump the extension strings. always call the base class.
     virtual void dump(String8& result);
@@ -93,8 +98,17 @@ public:
     virtual void checkErrors() const;
     virtual void setViewportAndProjection(size_t vpw, size_t vph,
             Rect sourceCrop, size_t hwh, bool yswap, Transform::orientation_flags rotation) = 0;
+#ifdef USE_HWC2
+    virtual void setupLayerBlending(bool premultipliedAlpha, bool opaque, float alpha) = 0;
+    virtual void setupDimLayerBlending(float alpha) = 0;
+    virtual void setColorMode(android_color_mode mode) = 0;
+    virtual void setSourceDataSpace(android_dataspace source) = 0;
+    virtual void setWideColor(bool hasWideColor) = 0;
+    virtual bool usesWideColor() = 0;
+#else
     virtual void setupLayerBlending(bool premultipliedAlpha, bool opaque, int alpha) = 0;
     virtual void setupDimLayerBlending(int alpha) = 0;
+#endif
     virtual void setupLayerTexturing(const Texture& texture) = 0;
     virtual void setupLayerBlackedOut() = 0;
     virtual void setupFillWithColor(float r, float g, float b, float a) = 0;

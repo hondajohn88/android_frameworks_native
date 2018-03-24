@@ -25,6 +25,7 @@
 namespace android {
 // ---------------------------------------------------------------------------
 
+class Fence;
 class IGraphicBufferProducer;
 class String8;
 
@@ -49,11 +50,13 @@ public:
     };
     virtual status_t prepareFrame(CompositionType compositionType) = 0;
 
+#ifndef USE_HWC2
     // Should be called when composition rendering is complete for a frame (but
     // eglSwapBuffers hasn't necessarily been called). Required by certain
     // older drivers for synchronization.
     // TODO: Remove this when we drop support for HWC 1.0.
     virtual status_t compositionComplete() = 0;
+#endif
 
     // Inform the surface that GLES composition is complete for this frame, and
     // the surface should make sure that HWComposer has the correct buffer for
@@ -73,6 +76,8 @@ public:
     virtual void dumpAsString(String8& result) const = 0;
 
     virtual void resizeBuffers(const uint32_t w, const uint32_t h) = 0;
+
+    virtual const sp<Fence>& getClientTargetAcquireFence() const = 0;
 
 protected:
     DisplaySurface() {}

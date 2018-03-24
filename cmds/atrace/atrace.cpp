@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#define LOG_TAG "atrace"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
@@ -24,28 +26,45 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sendfile.h>
 #include <time.h>
+#include <unistd.h>
 #include <zlib.h>
+
+#include <fstream>
+#include <memory>
 
 #include <binder/IBinder.h>
 #include <binder/IServiceManager.h>
 #include <binder/Parcel.h>
 
-#include <cutils/properties.h>
+#include <android/hidl/manager/1.0/IServiceManager.h>
+#include <hidl/ServiceManagement.h>
 
+#include <pdx/default_transport/service_utility.h>
 #include <utils/String8.h>
 #include <utils/Timers.h>
+#include <utils/Tokenizer.h>
 #include <utils/Trace.h>
+#include <android-base/file.h>
+#include <android-base/macros.h>
+#include <android-base/properties.h>
+#include <android-base/stringprintf.h>
 
 using namespace android;
+using pdx::default_transport::ServiceUtility;
 
-#define NELEM(x) ((int) (sizeof(x) / sizeof((x)[0])))
+using std::string;
 
-enum { MAX_SYS_FILES = 10 };
+#define MAX_SYS_FILES 10
+#define MAX_PACKAGES 16
 
 const char* k_traceTagsProperty = "debug.atrace.tags.enableflags";
-const char* k_traceAppCmdlineProperty = "debug.atrace.app_cmdlines";
+
+const char* k_traceAppsNumberProperty = "debug.atrace.app_number";
+const char* k_traceAppsPropertyTemplate = "debug.atrace.app_%d";
+const char* k_coreServiceCategory = "core_services";
+const char* k_pdxServiceCategory = "pdx";
+const char* k_coreServicesProp = "ro.atrace.core.services";
 
 typedef enum { OPT, REQ } requiredness  ;
 
@@ -73,7 +92,9 @@ struct TracingCategory {
 
 /* Tracing categories */
 static const TracingCategory k_categories[] = {
-    { "gfx",        "Graphics",         ATRACE_TAG_GRAPHICS, { } },
+    { "gfx",        "Graphics",         ATRACE_TAG_GRAPHICS, {
+        { OPT,      "events/mdss/enable" },
+    } },
     { "input",      "Input",            ATRACE_TAG_INPUT, { } },
     { "view",       "View System",      ATRACE_TAG_VIEW, { } },
     { "webview",    "WebView",          ATRACE_TAG_WEBVIEW, { } },
@@ -90,56 +111,93 @@ static const TracingCategory k_categories[] = {
     { "rs",         "RenderScript",     ATRACE_TAG_RS, { } },
     { "bionic",     "Bionic C Library", ATRACE_TAG_BIONIC, { } },
     { "power",      "Power Management", ATRACE_TAG_POWER, { } },
+    { "pm",         "Package Manager",  ATRACE_TAG_PACKAGE_MANAGER, { } },
+    { "ss",         "System Server",    ATRACE_TAG_SYSTEM_SERVER, { } },
+    { "database",   "Database",         ATRACE_TAG_DATABASE, { } },
+    { "network",    "Network",          ATRACE_TAG_NETWORK, { } },
+    { "adb",        "ADB",              ATRACE_TAG_ADB, { } },
+    { k_coreServiceCategory, "Core services", 0, { } },
+    { k_pdxServiceCategory, "PDX services", 0, { } },
     { "sched",      "CPU Scheduling",   0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/sched/sched_switch/enable" },
-        { REQ,      "/sys/kernel/debug/tracing/events/sched/sched_wakeup/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/sched/sched_blocked_reason/enable" },
+        { REQ,      "events/sched/sched_switch/enable" },
+        { REQ,      "events/sched/sched_wakeup/enable" },
+        { OPT,      "events/sched/sched_waking/enable" },
+        { OPT,      "events/sched/sched_blocked_reason/enable" },
+        { OPT,      "events/sched/sched_cpu_hotplug/enable" },
+        { OPT,      "events/cgroup/enable" },
     } },
     { "irq",        "IRQ Events",   0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/irq/enable" },
+        { REQ,      "events/irq/enable" },
+        { OPT,      "events/ipi/enable" },
+    } },
+    { "i2c",        "I2C Events",   0, {
+        { REQ,      "events/i2c/enable" },
+        { REQ,      "events/i2c/i2c_read/enable" },
+        { REQ,      "events/i2c/i2c_write/enable" },
+        { REQ,      "events/i2c/i2c_result/enable" },
+        { REQ,      "events/i2c/i2c_reply/enable" },
+        { OPT,      "events/i2c/smbus_read/enable" },
+        { OPT,      "events/i2c/smbus_write/enable" },
+        { OPT,      "events/i2c/smbus_result/enable" },
+        { OPT,      "events/i2c/smbus_reply/enable" },
     } },
     { "freq",       "CPU Frequency",    0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/power/cpu_frequency/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/power/clock_set_rate/enable" },
+        { REQ,      "events/power/cpu_frequency/enable" },
+        { OPT,      "events/power/clock_set_rate/enable" },
+        { OPT,      "events/power/cpu_frequency_limits/enable" },
     } },
     { "membus",     "Memory Bus Utilization", 0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/memory_bus/enable" },
+        { REQ,      "events/memory_bus/enable" },
     } },
     { "idle",       "CPU Idle",         0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/power/cpu_idle/enable" },
+        { REQ,      "events/power/cpu_idle/enable" },
     } },
     { "disk",       "Disk I/O",         0, {
-        { OPT,      "/sys/kernel/debug/tracing/events/f2fs/f2fs_sync_file_enter/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/f2fs/f2fs_sync_file_exit/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/f2fs/f2fs_write_begin/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/f2fs/f2fs_write_end/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/ext4/ext4_da_write_begin/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/ext4/ext4_da_write_end/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/ext4/ext4_sync_file_enter/enable" },
-        { OPT,      "/sys/kernel/debug/tracing/events/ext4/ext4_sync_file_exit/enable" },
-        { REQ,      "/sys/kernel/debug/tracing/events/block/block_rq_issue/enable" },
-        { REQ,      "/sys/kernel/debug/tracing/events/block/block_rq_complete/enable" },
+        { OPT,      "events/f2fs/f2fs_sync_file_enter/enable" },
+        { OPT,      "events/f2fs/f2fs_sync_file_exit/enable" },
+        { OPT,      "events/f2fs/f2fs_write_begin/enable" },
+        { OPT,      "events/f2fs/f2fs_write_end/enable" },
+        { OPT,      "events/ext4/ext4_da_write_begin/enable" },
+        { OPT,      "events/ext4/ext4_da_write_end/enable" },
+        { OPT,      "events/ext4/ext4_sync_file_enter/enable" },
+        { OPT,      "events/ext4/ext4_sync_file_exit/enable" },
+        { REQ,      "events/block/block_rq_issue/enable" },
+        { REQ,      "events/block/block_rq_complete/enable" },
     } },
     { "mmc",        "eMMC commands",    0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/mmc/enable" },
+        { REQ,      "events/mmc/enable" },
     } },
     { "load",       "CPU Load",         0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/cpufreq_interactive/enable" },
+        { REQ,      "events/cpufreq_interactive/enable" },
     } },
     { "sync",       "Synchronization",  0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/sync/enable" },
+        { REQ,      "events/sync/enable" },
     } },
     { "workq",      "Kernel Workqueues", 0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/workqueue/enable" },
+        { REQ,      "events/workqueue/enable" },
     } },
     { "memreclaim", "Kernel Memory Reclaim", 0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/vmscan/mm_vmscan_direct_reclaim_begin/enable" },
-        { REQ,      "/sys/kernel/debug/tracing/events/vmscan/mm_vmscan_direct_reclaim_end/enable" },
-        { REQ,      "/sys/kernel/debug/tracing/events/vmscan/mm_vmscan_kswapd_wake/enable" },
-        { REQ,      "/sys/kernel/debug/tracing/events/vmscan/mm_vmscan_kswapd_sleep/enable" },
+        { REQ,      "events/vmscan/mm_vmscan_direct_reclaim_begin/enable" },
+        { REQ,      "events/vmscan/mm_vmscan_direct_reclaim_end/enable" },
+        { REQ,      "events/vmscan/mm_vmscan_kswapd_wake/enable" },
+        { REQ,      "events/vmscan/mm_vmscan_kswapd_sleep/enable" },
+        { REQ,      "events/lowmemorykiller/enable" },
     } },
     { "regulators",  "Voltage and Current Regulators", 0, {
-        { REQ,      "/sys/kernel/debug/tracing/events/regulator/enable" },
+        { REQ,      "events/regulator/enable" },
+    } },
+    { "binder_driver", "Binder Kernel driver", 0, {
+        { REQ,      "events/binder/binder_transaction/enable" },
+        { REQ,      "events/binder/binder_transaction_received/enable" },
+        { OPT,      "events/binder/binder_set_priority/enable" },
+    } },
+    { "binder_lock", "Binder global lock trace", 0, {
+        { OPT,      "events/binder/binder_lock/enable" },
+        { OPT,      "events/binder/binder_locked/enable" },
+        { OPT,      "events/binder/binder_unlock/enable" },
+    } },
+    { "pagecache",  "Page cache", 0, {
+        { REQ,      "events/filemap/enable" },
     } },
 };
 
@@ -150,64 +208,74 @@ static int g_traceBufferSizeKB = 2048;
 static bool g_compress = false;
 static bool g_nohup = false;
 static int g_initialSleepSecs = 0;
+static const char* g_categoriesFile = NULL;
 static const char* g_kernelTraceFuncs = NULL;
 static const char* g_debugAppCmdLine = "";
+static const char* g_outputFile = nullptr;
 
 /* Global state */
+static bool g_tracePdx = false;
 static bool g_traceAborted = false;
-static bool g_categoryEnables[NELEM(k_categories)] = {};
+static bool g_categoryEnables[arraysize(k_categories)] = {};
+static std::string g_traceFolder;
 
 /* Sys file paths */
 static const char* k_traceClockPath =
-    "/sys/kernel/debug/tracing/trace_clock";
+    "trace_clock";
 
 static const char* k_traceBufferSizePath =
-    "/sys/kernel/debug/tracing/buffer_size_kb";
+    "buffer_size_kb";
+
+static const char* k_traceCmdlineSizePath =
+    "saved_cmdlines_size";
 
 static const char* k_tracingOverwriteEnablePath =
-    "/sys/kernel/debug/tracing/options/overwrite";
+    "options/overwrite";
 
 static const char* k_currentTracerPath =
-    "/sys/kernel/debug/tracing/current_tracer";
+    "current_tracer";
 
 static const char* k_printTgidPath =
-    "/sys/kernel/debug/tracing/options/print-tgid";
+    "options/print-tgid";
 
 static const char* k_funcgraphAbsTimePath =
-    "/sys/kernel/debug/tracing/options/funcgraph-abstime";
+    "options/funcgraph-abstime";
 
 static const char* k_funcgraphCpuPath =
-    "/sys/kernel/debug/tracing/options/funcgraph-cpu";
+    "options/funcgraph-cpu";
 
 static const char* k_funcgraphProcPath =
-    "/sys/kernel/debug/tracing/options/funcgraph-proc";
+    "options/funcgraph-proc";
 
 static const char* k_funcgraphFlatPath =
-    "/sys/kernel/debug/tracing/options/funcgraph-flat";
+    "options/funcgraph-flat";
 
 static const char* k_funcgraphDurationPath =
-    "/sys/kernel/debug/tracing/options/funcgraph-duration";
+    "options/funcgraph-duration";
 
 static const char* k_ftraceFilterPath =
-    "/sys/kernel/debug/tracing/set_ftrace_filter";
+    "set_ftrace_filter";
 
 static const char* k_tracingOnPath =
-    "/sys/kernel/debug/tracing/tracing_on";
+    "tracing_on";
 
 static const char* k_tracePath =
-    "/sys/kernel/debug/tracing/trace";
+    "trace";
+
+static const char* k_traceStreamPath =
+    "trace_pipe";
 
 static const char* k_traceMarkerPath =
-    "/sys/kernel/debug/tracing/trace_marker";
+    "trace_marker";
 
 // Check whether a file exists.
 static bool fileExists(const char* filename) {
-    return access(filename, F_OK) != -1;
+    return access((g_traceFolder + filename).c_str(), F_OK) != -1;
 }
 
 // Check whether a file is writable.
 static bool fileIsWritable(const char* filename) {
-    return access(filename, W_OK) != -1;
+    return access((g_traceFolder + filename).c_str(), W_OK) != -1;
 }
 
 // Truncate a file.
@@ -216,9 +284,9 @@ static bool truncateFile(const char* path)
     // This uses creat rather than truncate because some of the debug kernel
     // device nodes (e.g. k_ftraceFilterPath) currently aren't changed by
     // calls to truncate, but they are cleared by calls to creat.
-    int traceFD = creat(path, 0);
+    int traceFD = creat((g_traceFolder + path).c_str(), 0);
     if (traceFD == -1) {
-        fprintf(stderr, "error truncating %s: %s (%d)\n", path,
+        fprintf(stderr, "error truncating %s: %s (%d)\n", (g_traceFolder + path).c_str(),
             strerror(errno), errno);
         return false;
     }
@@ -230,9 +298,10 @@ static bool truncateFile(const char* path)
 
 static bool _writeStr(const char* filename, const char* str, int flags)
 {
-    int fd = open(filename, flags);
+    std::string fullFilename = g_traceFolder + filename;
+    int fd = open(fullFilename.c_str(), flags);
     if (fd == -1) {
-        fprintf(stderr, "error opening %s: %s (%d)\n", filename,
+        fprintf(stderr, "error opening %s: %s (%d)\n", fullFilename.c_str(),
                 strerror(errno), errno);
         return false;
     }
@@ -240,7 +309,7 @@ static bool _writeStr(const char* filename, const char* str, int flags)
     bool ok = true;
     ssize_t len = strlen(str);
     if (write(fd, str, len) != len) {
-        fprintf(stderr, "error writing to %s: %s (%d)\n", filename,
+        fprintf(stderr, "error writing to %s: %s (%d)\n", fullFilename.c_str(),
                 strerror(errno), errno);
         ok = false;
     }
@@ -266,7 +335,7 @@ static void writeClockSyncMarker()
 {
   char buffer[128];
   int len = 0;
-  int fd = open(k_traceMarkerPath, O_WRONLY);
+  int fd = open((g_traceFolder + k_traceMarkerPath).c_str(), O_WRONLY);
   if (fd == -1) {
       fprintf(stderr, "error opening %s: %s (%d)\n", k_traceMarkerPath,
               strerror(errno), errno);
@@ -301,6 +370,14 @@ static bool setKernelOptionEnable(const char* filename, bool enable)
 // or /sys/ files.
 static bool isCategorySupported(const TracingCategory& category)
 {
+    if (strcmp(category.name, k_coreServiceCategory) == 0) {
+        return !android::base::GetProperty(k_coreServicesProp, "").empty();
+    }
+
+    if (strcmp(category.name, k_pdxServiceCategory) == 0) {
+        return true;
+    }
+
     bool ok = category.tags != 0;
     for (int i = 0; i < MAX_SYS_FILES; i++) {
         const char* path = category.sysfiles[i].path;
@@ -313,7 +390,7 @@ static bool isCategorySupported(const TracingCategory& category)
                     ok = true;
                 }
             } else {
-                ok |= fileIsWritable(path);
+                ok = true;
             }
         }
     }
@@ -323,7 +400,7 @@ static bool isCategorySupported(const TracingCategory& category)
 // Check whether the category would be supported on the device if the user
 // were root.  This function assumes that root is able to write to any file
 // that exists.  It performs the same logic as isCategorySupported, but it
-// uses file existance rather than writability in the /sys/ file checks.
+// uses file existence rather than writability in the /sys/ file checks.
 static bool isCategorySupportedForRoot(const TracingCategory& category)
 {
     bool ok = category.tags != 0;
@@ -376,56 +453,40 @@ static bool setTraceBufferSizeKB(int size)
     return writeStr(k_traceBufferSizePath, str);
 }
 
-// Read the trace_clock sysfs file and return true if it matches the requested
-// value.  The trace_clock file format is:
-// local [global] counter uptime perf
-static bool isTraceClock(const char *mode)
+// Set the default size of cmdline hashtable
+static bool setCmdlineSize()
 {
-    int fd = open(k_traceClockPath, O_RDONLY);
-    if (fd == -1) {
-        fprintf(stderr, "error opening %s: %s (%d)\n", k_traceClockPath,
-            strerror(errno), errno);
-        return false;
+    if (fileExists(k_traceCmdlineSizePath)) {
+        return writeStr(k_traceCmdlineSizePath, "8192");
     }
-
-    char buf[4097];
-    ssize_t n = read(fd, buf, 4096);
-    close(fd);
-    if (n == -1) {
-        fprintf(stderr, "error reading %s: %s (%d)\n", k_traceClockPath,
-            strerror(errno), errno);
-        return false;
-    }
-    buf[n] = '\0';
-
-    char *start = strchr(buf, '[');
-    if (start == NULL) {
-        return false;
-    }
-    start++;
-
-    char *end = strchr(start, ']');
-    if (end == NULL) {
-        return false;
-    }
-    *end = '\0';
-
-    return strcmp(mode, start) == 0;
+    return true;
 }
 
-// Enable or disable the kernel's use of the global clock.  Disabling the global
-// clock will result in the kernel using a per-CPU local clock.
+// Set the clock to the best available option while tracing. Use 'boot' if it's
+// available; otherwise, use 'mono'. If neither are available use 'global'.
 // Any write to the trace_clock sysfs file will reset the buffer, so only
 // update it if the requested value is not the current value.
-static bool setGlobalClockEnable(bool enable)
+static bool setClock()
 {
-    const char *clock = enable ? "global" : "local";
+    std::ifstream clockFile((g_traceFolder + k_traceClockPath).c_str(), O_RDONLY);
+    std::string clockStr((std::istreambuf_iterator<char>(clockFile)),
+        std::istreambuf_iterator<char>());
 
-    if (isTraceClock(clock)) {
-        return true;
+    std::string newClock;
+    if (clockStr.find("boot") != std::string::npos) {
+        newClock = "boot";
+    } else if (clockStr.find("mono") != std::string::npos) {
+        newClock = "mono";
+    } else {
+        newClock = "global";
     }
 
-    return writeStr(k_traceClockPath, clock);
+    size_t begin = clockStr.find("[") + 1;
+    size_t end = clockStr.find("]");
+    if (newClock.compare(0, std::string::npos, clockStr, begin, end-begin) == 0) {
+        return true;
+    }
+    return writeStr(k_traceClockPath, newClock.c_str());
 }
 
 static bool setPrintTgidEnableIfPresent(bool enable)
@@ -463,25 +524,111 @@ static bool pokeBinderServices()
     return true;
 }
 
+// Poke all the HAL processes in the system to get them to re-read
+// their system properties.
+static void pokeHalServices()
+{
+    using ::android::hidl::base::V1_0::IBase;
+    using ::android::hidl::manager::V1_0::IServiceManager;
+    using ::android::hardware::hidl_string;
+    using ::android::hardware::Return;
+
+    sp<IServiceManager> sm = ::android::hardware::defaultServiceManager();
+
+    if (sm == nullptr) {
+        fprintf(stderr, "failed to get IServiceManager to poke hal services\n");
+        return;
+    }
+
+    auto listRet = sm->list([&](const auto &interfaces) {
+        for (size_t i = 0; i < interfaces.size(); i++) {
+            string fqInstanceName = interfaces[i];
+            string::size_type n = fqInstanceName.find("/");
+            if (n == std::string::npos || interfaces[i].size() == n+1)
+                continue;
+            hidl_string fqInterfaceName = fqInstanceName.substr(0, n);
+            hidl_string instanceName = fqInstanceName.substr(n+1, std::string::npos);
+            Return<sp<IBase>> interfaceRet = sm->get(fqInterfaceName, instanceName);
+            if (!interfaceRet.isOk()) {
+                // ignore
+                continue;
+            }
+
+            sp<IBase> interface = interfaceRet;
+            if (interface == nullptr) {
+                // ignore
+                continue;
+            }
+
+            auto notifyRet = interface->notifySyspropsChanged();
+            if (!notifyRet.isOk()) {
+                // ignore
+            }
+        }
+    });
+    if (!listRet.isOk()) {
+        // TODO(b/34242478) fix this when we determine the correct ACL
+        //fprintf(stderr, "failed to list services: %s\n", listRet.description().c_str());
+    }
+}
+
 // Set the trace tags that userland tracing uses, and poke the running
 // processes to pick up the new value.
 static bool setTagsProperty(uint64_t tags)
 {
-    char buf[64];
-    snprintf(buf, 64, "%#" PRIx64, tags);
-    if (property_set(k_traceTagsProperty, buf) < 0) {
+    std::string value = android::base::StringPrintf("%#" PRIx64, tags);
+    if (!android::base::SetProperty(k_traceTagsProperty, value)) {
         fprintf(stderr, "error setting trace tags system property\n");
         return false;
     }
     return true;
 }
 
+static void clearAppProperties()
+{
+    for (int i = 0; i < MAX_PACKAGES; i++) {
+        std::string key = android::base::StringPrintf(k_traceAppsPropertyTemplate, i);
+        if (!android::base::SetProperty(key, "")) {
+            fprintf(stderr, "failed to clear system property: %s\n", key.c_str());
+        }
+    }
+    if (!android::base::SetProperty(k_traceAppsNumberProperty, "")) {
+        fprintf(stderr, "failed to clear system property: %s",
+              k_traceAppsNumberProperty);
+    }
+}
+
 // Set the system property that indicates which apps should perform
 // application-level tracing.
-static bool setAppCmdlineProperty(const char* cmdline)
+static bool setAppCmdlineProperty(char* cmdline)
 {
-    if (property_set(k_traceAppCmdlineProperty, cmdline) < 0) {
-        fprintf(stderr, "error setting trace app system property\n");
+    int i = 0;
+    char* start = cmdline;
+    while (start != NULL) {
+        if (i == MAX_PACKAGES) {
+            fprintf(stderr, "error: only 16 packages could be traced at once\n");
+            clearAppProperties();
+            return false;
+        }
+        char* end = strchr(start, ',');
+        if (end != NULL) {
+            *end = '\0';
+            end++;
+        }
+        std::string key = android::base::StringPrintf(k_traceAppsPropertyTemplate, i);
+        if (!android::base::SetProperty(key, start)) {
+            fprintf(stderr, "error setting trace app %d property to %s\n", i, key.c_str());
+            clearAppProperties();
+            return false;
+        }
+        start = end;
+        i++;
+    }
+
+    std::string value = android::base::StringPrintf("%d", i);
+    if (!android::base::SetProperty(k_traceAppsNumberProperty, value)) {
+        fprintf(stderr, "error setting trace app number property to %s\n", value.c_str());
+        clearAppProperties();
         return false;
     }
     return true;
@@ -490,7 +637,7 @@ static bool setAppCmdlineProperty(const char* cmdline)
 // Disable all /sys/ enable files.
 static bool disableKernelTraceEvents() {
     bool ok = true;
-    for (int i = 0; i < NELEM(k_categories); i++) {
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
         const TracingCategory &c = k_categories[i];
         for (int j = 0; j < MAX_SYS_FILES; j++) {
             const char* path = c.sysfiles[j].path;
@@ -506,42 +653,33 @@ static bool disableKernelTraceEvents() {
 // kernel.
 static bool verifyKernelTraceFuncs(const char* funcs)
 {
-    int fd = open(k_ftraceFilterPath, O_RDONLY);
-    if (fd == -1) {
-        fprintf(stderr, "error opening %s: %s (%d)\n", k_ftraceFilterPath,
+    std::string buf;
+    if (!android::base::ReadFileToString(g_traceFolder + k_ftraceFilterPath, &buf)) {
+         fprintf(stderr, "error opening %s: %s (%d)\n", k_ftraceFilterPath,
             strerror(errno), errno);
-        return false;
+         return false;
     }
 
-    char buf[4097];
-    ssize_t n = read(fd, buf, 4096);
-    close(fd);
-    if (n == -1) {
-        fprintf(stderr, "error reading %s: %s (%d)\n", k_ftraceFilterPath,
-            strerror(errno), errno);
-        return false;
-    }
-
-    buf[n] = '\0';
-    String8 funcList = String8::format("\n%s", buf);
+    String8 funcList = String8::format("\n%s",buf.c_str());
 
     // Make sure that every function listed in funcs is in the list we just
-    // read from the kernel.
+    // read from the kernel, except for wildcard inputs.
     bool ok = true;
     char* myFuncs = strdup(funcs);
     char* func = strtok(myFuncs, ",");
     while (func) {
-        String8 fancyFunc = String8::format("\n%s\n", func);
-        bool found = funcList.find(fancyFunc.string(), 0) >= 0;
-        if (!found || func[0] == '\0') {
-            fprintf(stderr, "error: \"%s\" is not a valid kernel function "
-                "to trace.\n", func);
-            ok = false;
+        if (!strchr(func, '*')) {
+            String8 fancyFunc = String8::format("\n%s\n", func);
+            bool found = funcList.find(fancyFunc.string(), 0) >= 0;
+            if (!found || func[0] == '\0') {
+                fprintf(stderr, "error: \"%s\" is not a valid kernel function "
+                        "to trace.\n", func);
+                ok = false;
+            }
         }
         func = strtok(NULL, ",");
     }
     free(myFuncs);
-
     return ok;
 }
 
@@ -585,6 +723,52 @@ static bool setKernelTraceFuncs(const char* funcs)
     return ok;
 }
 
+static bool setCategoryEnable(const char* name, bool enable)
+{
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
+        const TracingCategory& c = k_categories[i];
+        if (strcmp(name, c.name) == 0) {
+            if (isCategorySupported(c)) {
+                g_categoryEnables[i] = enable;
+                return true;
+            } else {
+                if (isCategorySupportedForRoot(c)) {
+                    fprintf(stderr, "error: category \"%s\" requires root "
+                            "privileges.\n", name);
+                } else {
+                    fprintf(stderr, "error: category \"%s\" is not supported "
+                            "on this device.\n", name);
+                }
+                return false;
+            }
+        }
+    }
+    fprintf(stderr, "error: unknown tracing category \"%s\"\n", name);
+    return false;
+}
+
+static bool setCategoriesEnableFromFile(const char* categories_file)
+{
+    if (!categories_file) {
+        return true;
+    }
+    Tokenizer* tokenizer = NULL;
+    if (Tokenizer::open(String8(categories_file), &tokenizer) != NO_ERROR) {
+        return false;
+    }
+    bool ok = true;
+    while (!tokenizer->isEol()) {
+        String8 token = tokenizer->nextToken(" ");
+        if (token.isEmpty()) {
+            tokenizer->skipDelimiters(" ");
+            continue;
+        }
+        ok &= setCategoryEnable(token.string(), true);
+    }
+    delete tokenizer;
+    return ok;
+}
+
 // Set all the kernel tracing settings to the desired state for this trace
 // capture.
 static bool setUpTrace()
@@ -592,30 +776,58 @@ static bool setUpTrace()
     bool ok = true;
 
     // Set up the tracing options.
+    ok &= setCategoriesEnableFromFile(g_categoriesFile);
     ok &= setTraceOverwriteEnable(g_traceOverwrite);
     ok &= setTraceBufferSizeKB(g_traceBufferSizeKB);
-    ok &= setGlobalClockEnable(true);
+    // TODO: Re-enable after stabilization
+    //ok &= setCmdlineSize();
+    ok &= setClock();
     ok &= setPrintTgidEnableIfPresent(true);
     ok &= setKernelTraceFuncs(g_kernelTraceFuncs);
 
     // Set up the tags property.
     uint64_t tags = 0;
-    for (int i = 0; i < NELEM(k_categories); i++) {
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
         if (g_categoryEnables[i]) {
             const TracingCategory &c = k_categories[i];
             tags |= c.tags;
         }
     }
     ok &= setTagsProperty(tags);
-    ok &= setAppCmdlineProperty(g_debugAppCmdLine);
+
+    bool coreServicesTagEnabled = false;
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
+        if (strcmp(k_categories[i].name, k_coreServiceCategory) == 0) {
+            coreServicesTagEnabled = g_categoryEnables[i];
+        }
+
+        // Set whether to poke PDX services in this session.
+        if (strcmp(k_categories[i].name, k_pdxServiceCategory) == 0) {
+            g_tracePdx = g_categoryEnables[i];
+        }
+    }
+
+    std::string packageList(g_debugAppCmdLine);
+    if (coreServicesTagEnabled) {
+        if (!packageList.empty()) {
+            packageList += ",";
+        }
+        packageList += android::base::GetProperty(k_coreServicesProp, "");
+    }
+    ok &= setAppCmdlineProperty(&packageList[0]);
     ok &= pokeBinderServices();
+    pokeHalServices();
+
+    if (g_tracePdx) {
+        ok &= ServiceUtility::PokeServices();
+    }
 
     // Disable all the sysfs enables.  This is done as a separate loop from
     // the enables to allow the same enable to exist in multiple categories.
     ok &= disableKernelTraceEvents();
 
     // Enable all the sysfs enables that are in an enabled category.
-    for (int i = 0; i < NELEM(k_categories); i++) {
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
         if (g_categoryEnables[i]) {
             const TracingCategory &c = k_categories[i];
             for (int j = 0; j < MAX_SYS_FILES; j++) {
@@ -644,13 +856,16 @@ static void cleanUpTrace()
 
     // Reset the system properties.
     setTagsProperty(0);
-    setAppCmdlineProperty("");
+    clearAppProperties();
     pokeBinderServices();
+
+    if (g_tracePdx) {
+        ServiceUtility::PokeServices();
+    }
 
     // Set the options back to their defaults.
     setTraceOverwriteEnable(true);
     setTraceBufferSizeKB(1);
-    setGlobalClockEnable(false);
     setPrintTgidEnableIfPresent(false);
     setKernelTraceFuncs(NULL);
 }
@@ -668,10 +883,36 @@ static void stopTrace()
     setTracingEnabled(false);
 }
 
-// Read the current kernel trace and write it to stdout.
-static void dumpTrace()
+// Read data from the tracing pipe and forward to stdout
+static void streamTrace()
 {
-    int traceFD = open(k_tracePath, O_RDWR);
+    char trace_data[4096];
+    int traceFD = open((g_traceFolder + k_traceStreamPath).c_str(), O_RDWR);
+    if (traceFD == -1) {
+        fprintf(stderr, "error opening %s: %s (%d)\n", k_traceStreamPath,
+                strerror(errno), errno);
+        return;
+    }
+    while (!g_traceAborted) {
+        ssize_t bytes_read = read(traceFD, trace_data, 4096);
+        if (bytes_read > 0) {
+            write(STDOUT_FILENO, trace_data, bytes_read);
+            fflush(stdout);
+        } else {
+            if (!g_traceAborted) {
+                fprintf(stderr, "read returned %zd bytes err %d (%s)\n",
+                        bytes_read, errno, strerror(errno));
+            }
+            break;
+        }
+    }
+}
+
+// Read the current kernel trace and write it to stdout.
+static void dumpTrace(int outFd)
+{
+    ALOGI("Dumping trace");
+    int traceFD = open((g_traceFolder + k_tracePath).c_str(), O_RDWR);
     if (traceFD == -1) {
         fprintf(stderr, "error opening %s: %s (%d)\n", k_tracePath,
                 strerror(errno), errno);
@@ -680,30 +921,34 @@ static void dumpTrace()
 
     if (g_compress) {
         z_stream zs;
-        uint8_t *in, *out;
-        int result, flush;
-
         memset(&zs, 0, sizeof(zs));
-        result = deflateInit(&zs, Z_DEFAULT_COMPRESSION);
+
+        int result = deflateInit(&zs, Z_DEFAULT_COMPRESSION);
         if (result != Z_OK) {
             fprintf(stderr, "error initializing zlib: %d\n", result);
             close(traceFD);
             return;
         }
 
-        const size_t bufSize = 64*1024;
-        in = (uint8_t*)malloc(bufSize);
-        out = (uint8_t*)malloc(bufSize);
-        flush = Z_NO_FLUSH;
+        constexpr size_t bufSize = 64*1024;
+        std::unique_ptr<uint8_t> in(new uint8_t[bufSize]);
+        std::unique_ptr<uint8_t> out(new uint8_t[bufSize]);
+        if (!in || !out) {
+            fprintf(stderr, "couldn't allocate buffers\n");
+            close(traceFD);
+            return;
+        }
 
-        zs.next_out = out;
+        int flush = Z_NO_FLUSH;
+
+        zs.next_out = reinterpret_cast<Bytef*>(out.get());
         zs.avail_out = bufSize;
 
         do {
 
             if (zs.avail_in == 0) {
                 // More input is needed.
-                result = read(traceFD, in, bufSize);
+                result = read(traceFD, in.get(), bufSize);
                 if (result < 0) {
                     fprintf(stderr, "error reading trace: %s (%d)\n",
                             strerror(errno), errno);
@@ -712,14 +957,14 @@ static void dumpTrace()
                 } else if (result == 0) {
                     flush = Z_FINISH;
                 } else {
-                    zs.next_in = in;
+                    zs.next_in = reinterpret_cast<Bytef*>(in.get());
                     zs.avail_in = result;
                 }
             }
 
             if (zs.avail_out == 0) {
                 // Need to write the output.
-                result = write(STDOUT_FILENO, out, bufSize);
+                result = write(outFd, out.get(), bufSize);
                 if ((size_t)result < bufSize) {
                     fprintf(stderr, "error writing deflated trace: %s (%d)\n",
                             strerror(errno), errno);
@@ -727,7 +972,7 @@ static void dumpTrace()
                     zs.avail_out = bufSize; // skip the final write
                     break;
                 }
-                zs.next_out = out;
+                zs.next_out = reinterpret_cast<Bytef*>(out.get());
                 zs.avail_out = bufSize;
             }
 
@@ -739,7 +984,7 @@ static void dumpTrace()
 
         if (zs.avail_out < bufSize) {
             size_t bytes = bufSize - zs.avail_out;
-            result = write(STDOUT_FILENO, out, bytes);
+            result = write(outFd, out.get(), bytes);
             if ((size_t)result < bytes) {
                 fprintf(stderr, "error writing deflated trace: %s (%d)\n",
                         strerror(errno), errno);
@@ -750,15 +995,17 @@ static void dumpTrace()
         if (result != Z_OK) {
             fprintf(stderr, "error cleaning up zlib: %d\n", result);
         }
-
-        free(in);
-        free(out);
     } else {
-        ssize_t sent = 0;
-        while ((sent = sendfile(STDOUT_FILENO, traceFD, NULL, 64*1024*1024)) > 0);
-        if (sent == -1) {
-            fprintf(stderr, "error dumping trace: %s (%d)\n", strerror(errno),
-                    errno);
+        char buf[4096];
+        ssize_t rc;
+        while ((rc = TEMP_FAILURE_RETRY(read(traceFD, buf, sizeof(buf)))) > 0) {
+            if (!android::base::WriteFully(outFd, buf, rc)) {
+                fprintf(stderr, "error writing trace: %s\n", strerror(errno));
+                break;
+            }
+        }
+        if (rc == -1) {
+            fprintf(stderr, "error dumping trace: %s\n", strerror(errno));
         }
     }
 
@@ -784,33 +1031,9 @@ static void registerSigHandler()
     sigaction(SIGTERM, &sa, NULL);
 }
 
-static bool setCategoryEnable(const char* name, bool enable)
-{
-    for (int i = 0; i < NELEM(k_categories); i++) {
-        const TracingCategory& c = k_categories[i];
-        if (strcmp(name, c.name) == 0) {
-            if (isCategorySupported(c)) {
-                g_categoryEnables[i] = enable;
-                return true;
-            } else {
-                if (isCategorySupportedForRoot(c)) {
-                    fprintf(stderr, "error: category \"%s\" requires root "
-                            "privileges.\n", name);
-                } else {
-                    fprintf(stderr, "error: category \"%s\" is not supported "
-                            "on this device.\n", name);
-                }
-                return false;
-            }
-        }
-    }
-    fprintf(stderr, "error: unknown tracing category \"%s\"\n", name);
-    return false;
-}
-
 static void listSupportedCategories()
 {
-    for (int i = 0; i < NELEM(k_categories); i++) {
+    for (size_t i = 0; i < arraysize(k_categories); i++) {
         const TracingCategory& c = k_categories[i];
         if (isCategorySupported(c)) {
             printf("  %10s - %s\n", c.name, c.longname);
@@ -827,18 +1050,49 @@ static void showHelp(const char *cmd)
                         "separated list of cmdlines\n"
                     "  -b N            use a trace buffer size of N KB\n"
                     "  -c              trace into a circular buffer\n"
+                    "  -f filename     use the categories written in a file as space-separated\n"
+                    "                    values in a line\n"
                     "  -k fname,...    trace the listed kernel functions\n"
                     "  -n              ignore signals\n"
                     "  -s N            sleep for N seconds before tracing [default 0]\n"
-                    "  -t N            trace for N seconds [defualt 5]\n"
+                    "  -t N            trace for N seconds [default 5]\n"
                     "  -z              compress the trace dump\n"
-                    "  --async_start   start circular trace and return immediatly\n"
+                    "  --async_start   start circular trace and return immediately\n"
                     "  --async_dump    dump the current contents of circular trace buffer\n"
                     "  --async_stop    stop tracing and dump the current contents of circular\n"
                     "                    trace buffer\n"
+                    "  --stream        stream trace to stdout as it enters the trace buffer\n"
+                    "                    Note: this can take significant CPU time, and is best\n"
+                    "                    used for measuring things that are not affected by\n"
+                    "                    CPU performance, like pagecache usage.\n"
                     "  --list_categories\n"
                     "                  list the available tracing categories\n"
+                    " -o filename      write the trace to the specified file instead\n"
+                    "                    of stdout.\n"
             );
+}
+
+bool findTraceFiles()
+{
+    static const std::string debugfs_path = "/sys/kernel/debug/tracing/";
+    static const std::string tracefs_path = "/sys/kernel/tracing/";
+    static const std::string trace_file = "trace_marker";
+
+    bool tracefs = access((tracefs_path + trace_file).c_str(), F_OK) != -1;
+    bool debugfs = access((debugfs_path + trace_file).c_str(), F_OK) != -1;
+
+    if (!tracefs && !debugfs) {
+        fprintf(stderr, "Error: Did not find trace folder\n");
+        return false;
+    }
+
+    if (tracefs) {
+        g_traceFolder = tracefs_path;
+    } else {
+        g_traceFolder = debugfs_path;
+    }
+
+    return true;
 }
 
 int main(int argc, char **argv)
@@ -847,10 +1101,16 @@ int main(int argc, char **argv)
     bool traceStart = true;
     bool traceStop = true;
     bool traceDump = true;
+    bool traceStream = false;
 
     if (argc == 2 && 0 == strcmp(argv[1], "--help")) {
         showHelp(argv[0]);
         exit(0);
+    }
+
+    if (!findTraceFiles()) {
+        fprintf(stderr, "No trace folder found\n");
+        exit(-1);
     }
 
     for (;;) {
@@ -861,10 +1121,11 @@ int main(int argc, char **argv)
             {"async_stop",      no_argument, 0,  0 },
             {"async_dump",      no_argument, 0,  0 },
             {"list_categories", no_argument, 0,  0 },
+            {"stream",          no_argument, 0,  0 },
             {           0,                0, 0,  0 }
         };
 
-        ret = getopt_long(argc, argv, "a:b:ck:ns:t:z",
+        ret = getopt_long(argc, argv, "a:b:cf:k:ns:t:zo:",
                           long_options, &option_index);
 
         if (ret < 0) {
@@ -890,6 +1151,10 @@ int main(int argc, char **argv)
                 g_traceOverwrite = true;
             break;
 
+            case 'f':
+                g_categoriesFile = optarg;
+            break;
+
             case 'k':
                 g_kernelTraceFuncs = optarg;
             break;
@@ -910,6 +1175,10 @@ int main(int argc, char **argv)
                 g_compress = true;
             break;
 
+            case 'o':
+                g_outputFile = optarg;
+            break;
+
             case 0:
                 if (!strcmp(long_options[option_index].name, "async_start")) {
                     async = true;
@@ -923,6 +1192,9 @@ int main(int argc, char **argv)
                     async = true;
                     traceStart = false;
                     traceStop = false;
+                } else if (!strcmp(long_options[option_index].name, "stream")) {
+                    traceStream = true;
+                    traceDump = false;
                 } else if (!strcmp(long_options[option_index].name, "list_categories")) {
                     listSupportedCategories();
                     exit(0);
@@ -948,8 +1220,10 @@ int main(int argc, char **argv)
     ok &= startTrace();
 
     if (ok && traceStart) {
-        printf("capturing trace...");
-        fflush(stdout);
+        if (!traceStream) {
+            printf("capturing trace...");
+            fflush(stdout);
+        }
 
         // We clear the trace after starting it because tracing gets enabled for
         // each CPU individually in the kernel. Having the beginning of the trace
@@ -959,7 +1233,7 @@ int main(int argc, char **argv)
         ok = clearTrace();
 
         writeClockSyncMarker();
-        if (ok && !async) {
+        if (ok && !async && !traceStream) {
             // Sleep to allow the trace to be captured.
             struct timespec timeLeft;
             timeLeft.tv_sec = g_traceDurationSeconds;
@@ -970,6 +1244,10 @@ int main(int argc, char **argv)
                 }
             } while (nanosleep(&timeLeft, &timeLeft) == -1 && errno == EINTR);
         }
+
+        if (traceStream) {
+            streamTrace();
+        }
     }
 
     // Stop the trace and restore the default settings.
@@ -978,9 +1256,21 @@ int main(int argc, char **argv)
 
     if (ok && traceDump) {
         if (!g_traceAborted) {
-            printf(" done\nTRACE:\n");
+            printf(" done\n");
             fflush(stdout);
-            dumpTrace();
+            int outFd = STDOUT_FILENO;
+            if (g_outputFile) {
+                outFd = open(g_outputFile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            }
+            if (outFd == -1) {
+                printf("Failed to open '%s', err=%d", g_outputFile, errno);
+            } else {
+                dprintf(outFd, "TRACE:\n");
+                dumpTrace(outFd);
+                if (g_outputFile) {
+                    close(outFd);
+                }
+            }
         } else {
             printf("\ntrace aborted.\n");
             fflush(stdout);

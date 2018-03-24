@@ -33,6 +33,7 @@
 #include <utils/Mutex.h>
 #include <utils/Condition.h>
 
+#include <vector>
 #define CPU_CONSUMER_TEST_FORMAT_RAW 0
 #define CPU_CONSUMER_TEST_FORMAT_Y8 0
 #define CPU_CONSUMER_TEST_FORMAT_Y16 0
@@ -160,7 +161,7 @@ protected:
 };
 
 #define ASSERT_NO_ERROR(err, msg) \
-    ASSERT_EQ(NO_ERROR, err) << msg << strerror(-err)
+    ASSERT_EQ(NO_ERROR, err) << (msg) << strerror(-(err))
 
 void checkPixel(const CpuConsumer::LockedBuffer &buf,
         uint32_t x, uint32_t y, uint32_t r, uint32_t g=0, uint32_t b=0) {
@@ -444,19 +445,14 @@ void checkAnyBuffer(const CpuConsumer::LockedBuffer &buf, int format) {
     }
 }
 
-void fillYV12BufferRect(uint8_t* buf, int w, int h, int stride,
-        const android_native_rect_t& rect);
-
-void fillRGBA8Buffer(uint8_t* buf, int w, int h, int stride);
-
-void fillRGBA8BufferSolid(uint8_t* buf, int w, int h, int stride, uint8_t r,
-        uint8_t g, uint8_t b, uint8_t a);
-
 // Configures the ANativeWindow producer-side interface based on test parameters
 void configureANW(const sp<ANativeWindow>& anw,
         const CpuConsumerTestParams& params,
         int maxBufferSlack) {
     status_t err;
+    err = native_window_api_connect(anw.get(), NATIVE_WINDOW_API_CPU);
+    ASSERT_NO_ERROR(err, "connect error: ");
+
     err = native_window_set_buffers_dimensions(anw.get(),
             params.width, params.height);
     ASSERT_NO_ERROR(err, "set_buffers_dimensions error: ");
@@ -495,7 +491,7 @@ void produceOneFrame(const sp<ANativeWindow>& anw,
 
     ASSERT_TRUE(anb != NULL);
 
-    sp<GraphicBuffer> buf(new GraphicBuffer(anb, false));
+    sp<GraphicBuffer> buf(GraphicBuffer::from(anb));
 
     *stride = buf->getStride();
     uint8_t* img = NULL;
@@ -640,7 +636,7 @@ TEST_P(CpuConsumerTest, FromCpuLockMax) {
 
     // Consume
 
-    CpuConsumer::LockedBuffer *b = new CpuConsumer::LockedBuffer[params.maxLockedBuffers];
+    std::vector<CpuConsumer::LockedBuffer> b(params.maxLockedBuffers);
     for (int i = 0; i < params.maxLockedBuffers; i++) {
         ALOGV("Locking frame %d", i);
         err = mCC->lockNextBuffer(&b[i]);
@@ -689,9 +685,6 @@ TEST_P(CpuConsumerTest, FromCpuLockMax) {
     for (int i = 1; i < params.maxLockedBuffers; i++) {
         mCC->unlockBuffer(b[i]);
     }
-
-    delete[] b;
-
 }
 
 CpuConsumerTestParams y8TestSets[] = {

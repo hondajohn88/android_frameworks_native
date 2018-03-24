@@ -25,9 +25,12 @@
 #include <utils/Timers.h>
 #include <utils/Looper.h>
 
+#include <private/gui/BitTube.h>
 #include <gui/DisplayEventReceiver.h>
 
 #include "Barrier.h"
+
+#include <functional>
 
 namespace android {
 
@@ -57,6 +60,21 @@ private:
     mutable Barrier barrier;
 };
 
+class LambdaMessage : public MessageBase {
+public:
+    explicit LambdaMessage(std::function<void()> handler)
+          : MessageBase(), mHandler(std::move(handler)) {}
+
+    bool handler() override {
+        mHandler();
+        // This return value is no longer checked, so it's always safe to return true
+        return true;
+    }
+
+private:
+    const std::function<void()> mHandler;
+};
+
 // ---------------------------------------------------------------------------
 
 class MessageQueue {
@@ -69,11 +87,10 @@ class MessageQueue {
         MessageQueue& mQueue;
         int32_t mEventMask;
     public:
-        Handler(MessageQueue& queue) : mQueue(queue), mEventMask(0) { }
+        explicit Handler(MessageQueue& queue) : mQueue(queue), mEventMask(0) { }
         virtual void handleMessage(const Message& message);
         void dispatchRefresh();
         void dispatchInvalidate();
-        void dispatchTransaction();
     };
 
     friend class Handler;
@@ -82,7 +99,7 @@ class MessageQueue {
     sp<Looper> mLooper;
     sp<EventThread> mEventThread;
     sp<IDisplayEventConnection> mEvents;
-    sp<BitTube> mEventTube;
+    gui::BitTube mEventTube;
     sp<Handler> mHandler;
 
 
@@ -93,7 +110,6 @@ public:
     enum {
         INVALIDATE  = 0,
         REFRESH     = 1,
-        TRANSACTION = 2
     };
 
     MessageQueue();
@@ -108,8 +124,6 @@ public:
     void invalidate();
     // sends REFRESH message at next VSYNC
     void refresh();
-    // sends TRANSACTION message immediately
-    void invalidateTransactionNow();
 };
 
 // ---------------------------------------------------------------------------

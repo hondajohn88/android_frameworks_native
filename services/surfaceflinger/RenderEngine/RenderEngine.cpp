@@ -14,18 +14,19 @@
  * limitations under the License.
  */
 
-#include <cutils/log.h>
+#include <log/log.h>
 #include <ui/Rect.h>
 #include <ui/Region.h>
 
 #include "RenderEngine.h"
-#include "GLES10RenderEngine.h"
-#include "GLES11RenderEngine.h"
 #include "GLES20RenderEngine.h"
 #include "GLExtensions.h"
 #include "Mesh.h"
 
-EGLAPI const char* eglQueryStringImplementationANDROID(EGLDisplay dpy, EGLint name);
+#include <vector>
+#include <SurfaceFlinger.h>
+
+extern "C" EGLAPI const char* eglQueryStringImplementationANDROID(EGLDisplay dpy, EGLint name);
 
 // ---------------------------------------------------------------------------
 namespace android {
@@ -46,20 +47,24 @@ static bool findExtension(const char* exts, const char* name) {
     return false;
 }
 
-RenderEngine* RenderEngine::create(EGLDisplay display, int hwcFormat) {
+RenderEngine* RenderEngine::create(EGLDisplay display, int hwcFormat, uint32_t featureFlags) {
     // EGL_ANDROIDX_no_config_context is an experimental extension with no
     // written specification. It will be replaced by something more formal.
     // SurfaceFlinger is using it to allow a single EGLContext to render to
     // both a 16-bit primary display framebuffer and a 32-bit virtual display
     // framebuffer.
     //
+    // EGL_KHR_no_config_context is official extension to allow creating a
+    // context that works with any surface of a display.
+    //
     // The code assumes that ES2 or later is available if this extension is
     // supported.
     EGLConfig config = EGL_NO_CONFIG;
-    if (!findExtension(
-            eglQueryStringImplementationANDROID(display, EGL_EXTENSIONS),
-            "EGL_ANDROIDX_no_config_context")) {
-        config = chooseEglConfig(display, hwcFormat);
+    if (!findExtension(eglQueryStringImplementationANDROID(display, EGL_EXTENSIONS),
+                       "EGL_ANDROIDX_no_config_context") &&
+        !findExtension(eglQueryStringImplementationANDROID(display, EGL_EXTENSIONS),
+                       "EGL_KHR_no_config_context")) {
+        config = chooseEglConfig(display, hwcFormat, /*logConfig*/ true);
     }
 
     EGLint renderableType = 0;
@@ -78,18 +83,21 @@ RenderEngine* RenderEngine::create(EGLDisplay display, int hwcFormat) {
         LOG_ALWAYS_FATAL("no supported EGL_RENDERABLE_TYPEs");
     }
 
-    // Also create our EGLContext
-    EGLint contextAttributes[] = {
-            EGL_CONTEXT_CLIENT_VERSION, contextClientVersion,      // MUST be first
+    std::vector<EGLint> contextAttributes;
+    contextAttributes.reserve(6);
+    contextAttributes.push_back(EGL_CONTEXT_CLIENT_VERSION);
+    contextAttributes.push_back(contextClientVersion);
 #ifdef EGL_IMG_context_priority
-#ifdef HAS_CONTEXT_PRIORITY
-#warning "using EGL_IMG_context_priority"
-            EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_HIGH_IMG,
+    if (SurfaceFlinger::useContextPriority) {
+        contextAttributes.push_back(EGL_CONTEXT_PRIORITY_LEVEL_IMG);
+        contextAttributes.push_back(EGL_CONTEXT_PRIORITY_HIGH_IMG);
+    }
 #endif
-#endif
-            EGL_NONE, EGL_NONE
-    };
-    EGLContext ctxt = eglCreateContext(display, config, NULL, contextAttributes);
+    contextAttributes.push_back(EGL_NONE);
+    contextAttributes.push_back(EGL_NONE);
+
+    EGLContext ctxt = eglCreateContext(display, config, NULL,
+                                       contextAttributes.data());
 
     // if can't create a GL context, we can only abort.
     LOG_ALWAYS_FATAL_IF(ctxt==EGL_NO_CONTEXT, "EGLContext creation failed");
@@ -100,7 +108,7 @@ RenderEngine* RenderEngine::create(EGLDisplay display, int hwcFormat) {
 
     EGLConfig dummyConfig = config;
     if (dummyConfig == EGL_NO_CONFIG) {
-        dummyConfig = chooseEglConfig(display, hwcFormat);
+        dummyConfig = chooseEglConfig(display, hwcFormat, /*logConfig*/ true);
     }
     EGLint attribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE, EGL_NONE };
     EGLSurface dummy = eglCreatePbufferSurface(display, dummyConfig, attribs);
@@ -122,14 +130,12 @@ RenderEngine* RenderEngine::create(EGLDisplay display, int hwcFormat) {
     RenderEngine* engine = NULL;
     switch (version) {
     case GLES_VERSION_1_0:
-        engine = new GLES10RenderEngine();
-        break;
     case GLES_VERSION_1_1:
-        engine = new GLES11RenderEngine();
+        LOG_ALWAYS_FATAL("SurfaceFlinger requires OpenGL ES 2.0 minimum to run.");
         break;
     case GLES_VERSION_2_0:
     case GLES_VERSION_3_0:
-        engine = new GLES20RenderEngine();
+        engine = new GLES20RenderEngine(featureFlags);
         break;
     }
     engine->setEGLHandles(config, ctxt);
@@ -148,7 +154,7 @@ RenderEngine* RenderEngine::create(EGLDisplay display, int hwcFormat) {
     return engine;
 }
 
-RenderEngine::RenderEngine() : mEGLContext(EGL_NO_CONTEXT) {
+RenderEngine::RenderEngine() : mEGLConfig(NULL), mEGLContext(EGL_NO_CONTEXT) {
 }
 
 RenderEngine::~RenderEngine() {
@@ -316,8 +322,8 @@ class EGLAttributeVector {
     friend class Adder;
     KeyedVector<Attribute, EGLint> mList;
     struct Attribute {
-        Attribute() {};
-        Attribute(EGLint v) : v(v) { }
+        Attribute() : v(0) {};
+        explicit Attribute(EGLint v) : v(v) { }
         EGLint v;
         bool operator < (const Attribute& other) const {
             // this places EGL_NONE at the end
@@ -338,18 +344,18 @@ class EGLAttributeVector {
     public:
         void operator = (EGLint value) {
             if (attribute != EGL_NONE) {
-                v.mList.add(attribute, value);
+                v.mList.add(Attribute(attribute), value);
             }
         }
         operator EGLint () const { return v.mList[attribute]; }
     };
 public:
     EGLAttributeVector() {
-        mList.add(EGL_NONE, EGL_NONE);
+        mList.add(Attribute(EGL_NONE), EGL_NONE);
     }
     void remove(EGLint attribute) {
         if (attribute != EGL_NONE) {
-            mList.removeItem(attribute);
+            mList.removeItem(Attribute(attribute));
         }
     }
     Adder operator [] (EGLint attribute) {
@@ -380,6 +386,7 @@ static status_t selectEGLConfig(EGLDisplay display, EGLint format,
         attribs[EGL_RED_SIZE]                   = 8;
         attribs[EGL_GREEN_SIZE]                 = 8;
         attribs[EGL_BLUE_SIZE]                  = 8;
+        attribs[EGL_ALPHA_SIZE]                 = 8;
         wantedAttribute                         = EGL_NONE;
         wantedAttributeValue                    = EGL_NONE;
     } else {
@@ -399,7 +406,8 @@ static status_t selectEGLConfig(EGLDisplay display, EGLint format,
     return err;
 }
 
-EGLConfig RenderEngine::chooseEglConfig(EGLDisplay display, int format) {
+EGLConfig RenderEngine::chooseEglConfig(EGLDisplay display, int format,
+                                        bool logConfig) {
     status_t err;
     EGLConfig config;
 
@@ -420,20 +428,29 @@ EGLConfig RenderEngine::chooseEglConfig(EGLDisplay display, int format) {
         }
     }
 
-    // print some debugging info
-    EGLint r,g,b,a;
-    eglGetConfigAttrib(display, config, EGL_RED_SIZE,   &r);
-    eglGetConfigAttrib(display, config, EGL_GREEN_SIZE, &g);
-    eglGetConfigAttrib(display, config, EGL_BLUE_SIZE,  &b);
-    eglGetConfigAttrib(display, config, EGL_ALPHA_SIZE, &a);
-    ALOGI("EGL information:");
-    ALOGI("vendor    : %s", eglQueryString(display, EGL_VENDOR));
-    ALOGI("version   : %s", eglQueryString(display, EGL_VERSION));
-    ALOGI("extensions: %s", eglQueryString(display, EGL_EXTENSIONS));
-    ALOGI("Client API: %s", eglQueryString(display, EGL_CLIENT_APIS)?:"Not Supported");
-    ALOGI("EGLSurface: %d-%d-%d-%d, config=%p", r, g, b, a, config);
+    if (logConfig) {
+        // print some debugging info
+        EGLint r,g,b,a;
+        eglGetConfigAttrib(display, config, EGL_RED_SIZE,   &r);
+        eglGetConfigAttrib(display, config, EGL_GREEN_SIZE, &g);
+        eglGetConfigAttrib(display, config, EGL_BLUE_SIZE,  &b);
+        eglGetConfigAttrib(display, config, EGL_ALPHA_SIZE, &a);
+        ALOGI("EGL information:");
+        ALOGI("vendor    : %s", eglQueryString(display, EGL_VENDOR));
+        ALOGI("version   : %s", eglQueryString(display, EGL_VERSION));
+        ALOGI("extensions: %s", eglQueryString(display, EGL_EXTENSIONS));
+        ALOGI("Client API: %s", eglQueryString(display, EGL_CLIENT_APIS)?:"Not Supported");
+        ALOGI("EGLSurface: %d-%d-%d-%d, config=%p", r, g, b, a, config);
+    }
 
     return config;
+}
+
+
+void RenderEngine::primeCache() const {
+    // Getting the ProgramCache instance causes it to prime its shader cache,
+    // which is performed in its constructor
+    ProgramCache::getInstance();
 }
 
 // ---------------------------------------------------------------------------

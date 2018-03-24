@@ -19,7 +19,7 @@
 
 #include "InputWindow.h"
 
-#include <cutils/log.h>
+#include <log/log.h>
 
 #include <ui/Rect.h>
 #include <ui/Region.h>
@@ -36,19 +36,30 @@ bool InputWindowInfo::touchableRegionContainsPoint(int32_t x, int32_t y) const {
 }
 
 bool InputWindowInfo::frameContainsPoint(int32_t x, int32_t y) const {
-    return x >= frameLeft && x <= frameRight
-            && y >= frameTop && y <= frameBottom;
+    return x >= frameLeft && x < frameRight
+            && y >= frameTop && y < frameBottom;
 }
 
 bool InputWindowInfo::isTrustedOverlay() const {
     return layoutParamsType == TYPE_INPUT_METHOD
             || layoutParamsType == TYPE_INPUT_METHOD_DIALOG
             || layoutParamsType == TYPE_MAGNIFICATION_OVERLAY
-            || layoutParamsType == TYPE_SECURE_SYSTEM_OVERLAY;
+            || layoutParamsType == TYPE_STATUS_BAR
+            || layoutParamsType == TYPE_NAVIGATION_BAR
+            || layoutParamsType == TYPE_NAVIGATION_BAR_PANEL
+            || layoutParamsType == TYPE_SECURE_SYSTEM_OVERLAY
+            || layoutParamsType == TYPE_DOCK_DIVIDER
+            || layoutParamsType == TYPE_ACCESSIBILITY_OVERLAY
+            || layoutParamsType == TYPE_INPUT_CONSUMER;
 }
 
 bool InputWindowInfo::supportsSplitTouch() const {
     return layoutParamsFlags & FLAG_SPLIT_TOUCH;
+}
+
+bool InputWindowInfo::overlaps(const InputWindowInfo* other) const {
+    return frameLeft < other->frameRight && frameRight > other->frameLeft
+            && frameTop < other->frameBottom && frameBottom > other->frameTop;
 }
 
 

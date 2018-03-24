@@ -15,17 +15,26 @@
  */
 
 #define __STDC_LIMIT_MACROS 1
+#define ATRACE_TAG ATRACE_TAG_GRAPHICS
 
-#include <string.h>
+#include "egl_display.h"
 
 #include "../egl_impl.h"
 
+#include <private/EGL/display.h>
+
 #include "egl_cache.h"
-#include "egl_display.h"
 #include "egl_object.h"
 #include "egl_tls.h"
+#include "egl_trace.h"
 #include "Loader.h"
 #include <cutils/properties.h>
+
+#include <android/hardware/configstore/1.0/ISurfaceFlingerConfigs.h>
+#include <configstore/Utils.h>
+
+using namespace android::hardware::configstore;
+using namespace android::hardware::configstore::V1_0;
 
 // ----------------------------------------------------------------------------
 namespace android {
@@ -38,20 +47,24 @@ static char const * const sClientApiString  = "OpenGL_ES";
 extern char const * const gBuiltinExtensionString;
 extern char const * const gExtensionString;
 
-extern void initEglTraceLevel();
-extern void initEglDebugLevel();
 extern void setGLHooksThreadSpecific(gl_hooks_t const *value);
 
 // ----------------------------------------------------------------------------
 
 static bool findExtension(const char* exts, const char* name, size_t nameLen) {
     if (exts) {
-        const char* match = strstr(exts, name);
-        if (match && (match[nameLen] == '\0' || match[nameLen] == ' ')) {
-            return true;
+        for (const char* match = strstr(exts, name); match; match = strstr(match + nameLen, name)) {
+            if (match[nameLen] == '\0' || match[nameLen] == ' ') {
+                return true;
+            }
         }
     }
     return false;
+}
+
+int egl_get_init_count(EGLDisplay dpy) {
+    egl_display_t* eglDisplay = egl_display_t::get(dpy);
+    return eglDisplay ? eglDisplay->getRefsCount() : 0;
 }
 
 egl_display_t egl_display_t::sDisplay[NUM_DISPLAYS];
@@ -67,22 +80,25 @@ egl_display_t::~egl_display_t() {
 
 egl_display_t* egl_display_t::get(EGLDisplay dpy) {
     uintptr_t index = uintptr_t(dpy)-1U;
-    return (index >= NUM_DISPLAYS) ? NULL : &sDisplay[index];
+    if (index >= NUM_DISPLAYS || !sDisplay[index].isValid()) {
+        return nullptr;
+    }
+    return &sDisplay[index];
 }
 
 void egl_display_t::addObject(egl_object_t* object) {
-    Mutex::Autolock _l(lock);
-    objects.add(object);
+    std::lock_guard<std::mutex> _l(lock);
+    objects.insert(object);
 }
 
 void egl_display_t::removeObject(egl_object_t* object) {
-    Mutex::Autolock _l(lock);
-    objects.remove(object);
+    std::lock_guard<std::mutex> _l(lock);
+    objects.erase(object);
 }
 
 bool egl_display_t::getObject(egl_object_t* object) const {
-    Mutex::Autolock _l(lock);
-    if (objects.indexOf(object) >= 0) {
+    std::lock_guard<std::mutex> _l(lock);
+    if (objects.find(object) != objects.end()) {
         if (object->getDisplay() == this) {
             object->incRef();
             return true;
@@ -100,7 +116,8 @@ EGLDisplay egl_display_t::getFromNativeDisplay(EGLNativeDisplayType disp) {
 
 EGLDisplay egl_display_t::getDisplay(EGLNativeDisplayType display) {
 
-    Mutex::Autolock _l(lock);
+    std::lock_guard<std::mutex> _l(lock);
+    ATRACE_CALL();
 
     // get our driver loader
     Loader& loader(Loader::getInstance());
@@ -120,33 +137,26 @@ EGLDisplay egl_display_t::getDisplay(EGLNativeDisplayType display) {
 
 EGLBoolean egl_display_t::initialize(EGLint *major, EGLint *minor) {
 
-    {
-        Mutex::Autolock _rf(refLock);
-
+    { // scope for refLock
+        std::unique_lock<std::mutex> _l(refLock);
         refs++;
         if (refs > 1) {
             if (major != NULL)
                 *major = VERSION_MAJOR;
             if (minor != NULL)
                 *minor = VERSION_MINOR;
-            while(!eglIsInitialized) refCond.wait(refLock);
+            while(!eglIsInitialized) {
+                refCond.wait(_l);
+            }
             return EGL_TRUE;
         }
-
-        while(eglIsInitialized) refCond.wait(refLock);
+        while(eglIsInitialized) {
+            refCond.wait(_l);
+        }
     }
 
-    {
-        Mutex::Autolock _l(lock);
-
-#if EGL_TRACE
-
-        // Called both at early_init time and at this time. (Early_init is pre-zygote, so
-        // the information from that call may be stale.)
-        initEglTraceLevel();
-        initEglDebugLevel();
-
-#endif
+    { // scope for lock
+        std::lock_guard<std::mutex> _l(lock);
 
         setGLHooksThreadSpecific(&gHooksNoContext);
 
@@ -183,31 +193,38 @@ EGLBoolean egl_display_t::initialize(EGLint *major, EGLint *minor) {
         }
 
         // the query strings are per-display
-        mVendorString.setTo(sVendorString);
-        mVersionString.setTo(sVersionString);
-        mClientApiString.setTo(sClientApiString);
+        mVendorString = sVendorString;
+        mVersionString = sVersionString;
+        mClientApiString = sClientApiString;
 
-        mExtensionString.setTo(gBuiltinExtensionString);
+        mExtensionString = gBuiltinExtensionString;
+
+        bool wideColorBoardConfig =
+                getBool<ISurfaceFlingerConfigs, &ISurfaceFlingerConfigs::hasWideColorDisplay>(
+                        false);
+
+        // Add wide-color extensions if device can support wide-color
+        if (wideColorBoardConfig) {
+            mExtensionString.append(
+                    "EGL_EXT_gl_colorspace_scrgb EGL_EXT_gl_colorspace_scrgb_linear "
+                    "EGL_EXT_gl_colorspace_display_p3_linear EGL_EXT_gl_colorspace_display_p3 ");
+        }
+
         char const* start = gExtensionString;
-        char const* end;
         do {
-            // find the space separating this extension for the next one
-            end = strchr(start, ' ');
-            if (end) {
-                // length of the extension string
-                const size_t len = end - start;
-                if (len) {
-                    // NOTE: we could avoid the copy if we had strnstr.
-                    const String8 ext(start, len);
-                    if (findExtension(disp.queryString.extensions, ext.string(),
-                            len)) {
-                        mExtensionString.append(start, len+1);
-                    }
+            // length of the extension name
+            size_t len = strcspn(start, " ");
+            if (len) {
+                // NOTE: we could avoid the copy if we had strnstr.
+                const std::string ext(start, len);
+                if (findExtension(disp.queryString.extensions, ext.c_str(), len)) {
+                    mExtensionString.append(ext + " ");
                 }
-                // process the next extension string, and skip the space.
-                start = end + 1;
+                // advance to the next extension name, skipping the space.
+                start += len;
+                start += (*start == ' ') ? 1 : 0;
             }
-        } while (end);
+        } while (*start != '\0');
 
         egl_cache_t::get()->initialize(this);
 
@@ -226,14 +243,12 @@ EGLBoolean egl_display_t::initialize(EGLint *major, EGLint *minor) {
             *major = VERSION_MAJOR;
         if (minor != NULL)
             *minor = VERSION_MINOR;
-
-        mHibernation.setDisplayValid(true);
     }
 
-    {
-        Mutex::Autolock _rf(refLock);
+    { // scope for refLock
+        std::unique_lock<std::mutex> _l(refLock);
         eglIsInitialized = true;
-        refCond.broadcast();
+        refCond.notify_all();
     }
 
     return EGL_TRUE;
@@ -241,8 +256,8 @@ EGLBoolean egl_display_t::initialize(EGLint *major, EGLint *minor) {
 
 EGLBoolean egl_display_t::terminate() {
 
-    {
-        Mutex::Autolock _rl(refLock);
+    { // scope for refLock
+        std::unique_lock<std::mutex> _rl(refLock);
         if (refs == 0) {
             /*
              * From the EGL spec (3.2):
@@ -262,8 +277,8 @@ EGLBoolean egl_display_t::terminate() {
 
     EGLBoolean res = EGL_FALSE;
 
-    {
-        Mutex::Autolock _l(lock);
+    { // scope for lock
+        std::lock_guard<std::mutex> _l(lock);
 
         egl_connection_t* const cnx = &gEGLImpl;
         if (cnx->dso && disp.state == egl_display_t::INITIALIZED) {
@@ -276,19 +291,16 @@ EGLBoolean egl_display_t::terminate() {
             res = EGL_TRUE;
         }
 
-        mHibernation.setDisplayValid(false);
-
         // Reset the extension string since it will be regenerated if we get
         // reinitialized.
-        mExtensionString.setTo("");
+        mExtensionString.clear();
 
         // Mark all objects remaining in the list as terminated, unless
         // there are no reference to them, it which case, we're free to
         // delete them.
         size_t count = objects.size();
-        ALOGW_IF(count, "eglTerminate() called w/ %d objects remaining", count);
-        for (size_t i=0 ; i<count ; i++) {
-            egl_object_t* o = objects.itemAt(i);
+        ALOGW_IF(count, "eglTerminate() called w/ %zu objects remaining", count);
+        for (auto o : objects) {
             o->destroy();
         }
 
@@ -296,10 +308,10 @@ EGLBoolean egl_display_t::terminate() {
         objects.clear();
     }
 
-    {
-        Mutex::Autolock _rl(refLock);
+    { // scope for refLock
+        std::unique_lock<std::mutex> _rl(refLock);
         eglIsInitialized = false;
-        refCond.broadcast();
+        refCond.notify_all();
     }
 
     return res;
@@ -324,7 +336,7 @@ void egl_display_t::loseCurrentImpl(egl_context_t * cur_c)
     SurfaceRef _cur_d(cur_c ? get_surface(cur_c->draw) : NULL);
 
     { // scope for the lock
-        Mutex::Autolock _l(lock);
+        std::lock_guard<std::mutex> _l(lock);
         cur_c->onLooseCurrent();
 
     }
@@ -350,22 +362,18 @@ EGLBoolean egl_display_t::makeCurrent(egl_context_t* c, egl_context_t* cur_c,
     SurfaceRef _cur_d(cur_c ? get_surface(cur_c->draw) : NULL);
 
     { // scope for the lock
-        Mutex::Autolock _l(lock);
+        std::lock_guard<std::mutex> _l(lock);
         if (c) {
             result = c->cnx->egl.eglMakeCurrent(
                     disp.dpy, impl_draw, impl_read, impl_ctx);
             if (result == EGL_TRUE) {
                 c->onMakeCurrent(draw, read);
-                if (!cur_c) {
-                    mHibernation.incWakeCount(HibernationMachine::STRONG);
-                }
             }
         } else {
             result = cur_c->cnx->egl.eglMakeCurrent(
                     disp.dpy, impl_draw, impl_read, impl_ctx);
             if (result == EGL_TRUE) {
                 cur_c->onLooseCurrent();
-                mHibernation.decWakeCount(HibernationMachine::STRONG);
             }
         }
     }
@@ -386,65 +394,7 @@ bool egl_display_t::haveExtension(const char* name, size_t nameLen) const {
     if (!nameLen) {
         nameLen = strlen(name);
     }
-    return findExtension(mExtensionString.string(), name, nameLen);
-}
-
-// ----------------------------------------------------------------------------
-
-bool egl_display_t::HibernationMachine::incWakeCount(WakeRefStrength strength) {
-    Mutex::Autolock _l(mLock);
-    ALOGE_IF(mWakeCount < 0 || mWakeCount == INT32_MAX,
-             "Invalid WakeCount (%d) on enter\n", mWakeCount);
-
-    mWakeCount++;
-    if (strength == STRONG)
-        mAttemptHibernation = false;
-
-    if (CC_UNLIKELY(mHibernating)) {
-        ALOGV("Awakening\n");
-        egl_connection_t* const cnx = &gEGLImpl;
-
-        // These conditions should be guaranteed before entering hibernation;
-        // we don't want to get into a state where we can't wake up.
-        ALOGD_IF(!mDpyValid || !cnx->egl.eglAwakenProcessIMG,
-                 "Invalid hibernation state, unable to awaken\n");
-
-        if (!cnx->egl.eglAwakenProcessIMG()) {
-            ALOGE("Failed to awaken EGL implementation\n");
-            return false;
-        }
-        mHibernating = false;
-    }
-    return true;
-}
-
-void egl_display_t::HibernationMachine::decWakeCount(WakeRefStrength strength) {
-    Mutex::Autolock _l(mLock);
-    ALOGE_IF(mWakeCount <= 0, "Invalid WakeCount (%d) on leave\n", mWakeCount);
-
-    mWakeCount--;
-    if (strength == STRONG)
-        mAttemptHibernation = true;
-
-    if (mWakeCount == 0 && CC_UNLIKELY(mAttemptHibernation)) {
-        egl_connection_t* const cnx = &gEGLImpl;
-        mAttemptHibernation = false;
-        if (mAllowHibernation && mDpyValid &&
-                cnx->egl.eglHibernateProcessIMG &&
-                cnx->egl.eglAwakenProcessIMG) {
-            ALOGV("Hibernating\n");
-            if (!cnx->egl.eglHibernateProcessIMG()) {
-                ALOGE("Failed to hibernate EGL implementation\n");
-                return;
-            }
-            mHibernating = true;
-        }
-    }
-}
-
-void egl_display_t::HibernationMachine::setDisplayValid(bool valid) {
-    Mutex::Autolock _l(mLock);
-    mDpyValid = valid;
+    return findExtension(mExtensionString.c_str(), name, nameLen);
 }
 
 // ----------------------------------------------------------------------------

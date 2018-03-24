@@ -62,6 +62,8 @@
  *   frame for cases where an equivalent color does not exist.
  */
 
+#define LOG_TAG "hwcColorEquivTest"
+
 #include <algorithm>
 #include <assert.h>
 #include <cerrno>
@@ -87,7 +89,6 @@
 
 #include <ui/GraphicBuffer.h>
 
-#define LOG_TAG "hwcColorEquivTest"
 #include <utils/Log.h>
 #include <testUtil.h>
 
@@ -115,7 +116,7 @@ const float defaultEndDelay = 2.0; // Default delay after rendering graphics
 #define CMD_START_FRAMEWORK  "start 2>&1"
 
 // Macros
-#define NUMA(a) (sizeof(a) / sizeof(a [0])) // Num elements in an array
+#define NUMA(a) (sizeof(a) / sizeof((a)[0])) // Num elements in an array
 #define MEMCLR(addr, size) do { \
         memset((addr), 0, (size)); \
     } while (0)

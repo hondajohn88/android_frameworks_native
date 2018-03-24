@@ -101,7 +101,11 @@ struct InputWindowInfo {
         TYPE_NAVIGATION_BAR     = FIRST_SYSTEM_WINDOW+19,
         TYPE_VOLUME_OVERLAY = FIRST_SYSTEM_WINDOW+20,
         TYPE_BOOT_PROGRESS = FIRST_SYSTEM_WINDOW+21,
-        TYPE_MAGNIFICATION_OVERLAY = FIRST_SYSTEM_WINDOW+22,
+        TYPE_INPUT_CONSUMER = FIRST_SYSTEM_WINDOW+22,
+        TYPE_NAVIGATION_BAR_PANEL = FIRST_SYSTEM_WINDOW+24,
+        TYPE_MAGNIFICATION_OVERLAY = FIRST_SYSTEM_WINDOW+27,
+        TYPE_ACCESSIBILITY_OVERLAY = FIRST_SYSTEM_WINDOW+32,
+        TYPE_DOCK_DIVIDER = FIRST_SYSTEM_WINDOW+34,
         LAST_SYSTEM_WINDOW      = 2999,
     };
 
@@ -146,6 +150,8 @@ struct InputWindowInfo {
     bool isTrustedOverlay() const;
 
     bool supportsSplitTouch() const;
+
+    bool overlaps(const InputWindowInfo* other) const;
 };
 
 
@@ -193,7 +199,7 @@ public:
     void releaseInfo();
 
 protected:
-    InputWindowHandle(const sp<InputApplicationHandle>& inputApplicationHandle);
+    explicit InputWindowHandle(const sp<InputApplicationHandle>& inputApplicationHandle);
     virtual ~InputWindowHandle();
 
     InputWindowInfo* mInfo;

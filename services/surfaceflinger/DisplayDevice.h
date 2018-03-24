@@ -17,21 +17,31 @@
 #ifndef ANDROID_DISPLAY_DEVICE_H
 #define ANDROID_DISPLAY_DEVICE_H
 
+#include "Transform.h"
+
 #include <stdlib.h>
 
+#ifndef USE_HWC2
 #include <ui/PixelFormat.h>
+#endif
 #include <ui/Region.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
 
+#ifdef USE_HWC2
+#include <binder/IBinder.h>
+#include <utils/RefBase.h>
+#endif
 #include <utils/Mutex.h>
 #include <utils/String8.h>
 #include <utils/Timers.h>
 
 #include <hardware/hwcomposer_defs.h>
 
-#include "Transform.h"
+#ifdef USE_HWC2
+#include <memory>
+#endif
 
 struct ANativeWindow;
 
@@ -39,6 +49,7 @@ namespace android {
 
 struct DisplayInfo;
 class DisplaySurface;
+class Fence;
 class IGraphicBufferProducer;
 class Layer;
 class SurfaceFlinger;
@@ -72,16 +83,21 @@ public:
         NO_LAYER_STACK = 0xFFFFFFFF,
     };
 
+    // clang-format off
     DisplayDevice(
             const sp<SurfaceFlinger>& flinger,
             DisplayType type,
-            int32_t hwcId,  // negative for non-HWC-composited displays
+            int32_t hwcId,
+#ifndef USE_HWC2
             int format,
+#endif
             bool isSecure,
             const wp<IBinder>& displayToken,
             const sp<DisplaySurface>& displaySurface,
             const sp<IGraphicBufferProducer>& producer,
-            EGLConfig config);
+            EGLConfig config,
+            bool supportWideColor);
+    // clang-format on
 
     ~DisplayDevice();
 
@@ -99,14 +115,15 @@ public:
 
     int         getWidth() const;
     int         getHeight() const;
+#ifndef USE_HWC2
     PixelFormat getFormat() const;
+#endif
     uint32_t    getFlags() const;
 
     EGLSurface  getEGLSurface() const;
 
     void                    setVisibleLayersSortedByZ(const Vector< sp<Layer> >& layers);
     const Vector< sp<Layer> >& getVisibleLayersSortedByZ() const;
-    bool                    getSecureLayerVisible() const;
     Region                  getDirtyRegion(bool repaintEverything) const;
 
     void                    setLayerStack(uint32_t stack);
@@ -115,6 +132,7 @@ public:
 
     int                     getOrientation() const { return mOrientation; }
     uint32_t                getOrientationTransform() const;
+    static uint32_t         getPrimaryDisplayOrientationTransform();
     const Transform&        getTransform() const { return mGlobalTransform; }
     const Rect              getViewport() const { return mViewport; }
     const Rect              getFrame() const { return mFrame; }
@@ -123,19 +141,31 @@ public:
 
     uint32_t                getLayerStack() const { return mLayerStack; }
     int32_t                 getDisplayType() const { return mType; }
+    bool                    isPrimary() const { return mType == DISPLAY_PRIMARY; }
     int32_t                 getHwcDisplayId() const { return mHwcDisplayId; }
     const wp<IBinder>&      getDisplayToken() const { return mDisplayToken; }
 
     // We pass in mustRecompose so we can keep VirtualDisplaySurface's state
     // machine happy without actually queueing a buffer if nothing has changed
     status_t beginFrame(bool mustRecompose) const;
+#ifdef USE_HWC2
+    status_t prepareFrame(HWComposer& hwc);
+    bool getWideColorSupport() const { return mDisplayHasWideColor; }
+#else
     status_t prepareFrame(const HWComposer& hwc) const;
+#endif
 
     void swapBuffers(HWComposer& hwc) const;
+#ifndef USE_HWC2
     status_t compositionComplete() const;
+#endif
 
     // called after h/w composer has completed its set() call
+#ifdef USE_HWC2
+    void onSwapBuffersCompleted() const;
+#else
     void onSwapBuffersCompleted(HWComposer& hwc) const;
+#endif
 
     Rect getBounds() const {
         return Rect(mDisplayWidth, mDisplayHeight);
@@ -148,12 +178,20 @@ public:
     EGLBoolean makeCurrent(EGLDisplay dpy, EGLContext ctx) const;
     void setViewportAndProjection() const;
 
+    const sp<Fence>& getClientTargetAcquireFence() const;
+
     /* ------------------------------------------------------------------------
      * Display power mode management.
      */
     int getPowerMode() const;
     void setPowerMode(int mode);
     bool isDisplayOn() const;
+
+#ifdef USE_HWC2
+    android_color_mode_t getActiveColorMode() const;
+    void setActiveColorMode(android_color_mode_t mode);
+    void setCompositionDataSpace(android_dataspace dataspace);
+#endif
 
     /* ------------------------------------------------------------------------
      * Display active config management.
@@ -188,7 +226,9 @@ private:
     EGLSurface      mSurface;
     int             mDisplayWidth;
     int             mDisplayHeight;
+#ifndef USE_HWC2
     PixelFormat     mFormat;
+#endif
     uint32_t        mFlags;
     mutable uint32_t mPageFlipCount;
     String8         mDisplayName;
@@ -202,18 +242,19 @@ private:
     // list of visible layers on that display
     Vector< sp<Layer> > mVisibleLayersSortedByZ;
 
-    // Whether we have a visible secure layer on this display
-    bool mSecureLayerVisible;
-
-
     /*
      * Transaction state
      */
-    static status_t orientationToTransfrom(int orientation,
+    status_t orientationToTransfrom(int orientation,
             int w, int h, Transform* tr);
 
+    // The identifier of the active layer stack for this display. Several displays
+    // can use the same layer stack: A z-ordered group of layers (sometimes called
+    // "surfaces"). Any given layer can only be on a single layer stack.
     uint32_t mLayerStack;
+
     int mOrientation;
+    static uint32_t sPrimaryDisplayOrientation;
     // user-provided visible area of the layer stack
     Rect mViewport;
     // user-provided rectangle where mViewport gets mapped to
@@ -226,6 +267,39 @@ private:
     int mPowerMode;
     // Current active config
     int mActiveConfig;
+    // Panel hardware rotation
+    int32_t mHardwareRotation;
+#ifdef USE_HWC2
+    // current active color mode
+    android_color_mode_t mActiveColorMode;
+
+    // Need to know if display is wide-color capable or not.
+    // Initialized by SurfaceFlinger when the DisplayDevice is created.
+    // Fed to RenderEngine during composition.
+    bool mDisplayHasWideColor;
+#endif
+};
+
+struct DisplayDeviceState {
+    DisplayDeviceState() = default;
+    DisplayDeviceState(DisplayDevice::DisplayType type, bool isSecure);
+
+    bool isValid() const { return type >= 0; }
+    bool isMainDisplay() const { return type == DisplayDevice::DISPLAY_PRIMARY; }
+    bool isVirtualDisplay() const { return type >= DisplayDevice::DISPLAY_VIRTUAL; }
+
+    static std::atomic<int32_t> nextDisplayId;
+    int32_t displayId = nextDisplayId++;
+    DisplayDevice::DisplayType type = DisplayDevice::DISPLAY_ID_INVALID;
+    sp<IGraphicBufferProducer> surface;
+    uint32_t layerStack = DisplayDevice::NO_LAYER_STACK;
+    Rect viewport;
+    Rect frame;
+    uint8_t orientation = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    String8 displayName;
+    bool isSecure = false;
 };
 
 }; // namespace android

@@ -307,11 +307,23 @@ static const InputEventLabel KEYCODES[] = {
     DEFINE_KEYCODE(STEM_1),
     DEFINE_KEYCODE(STEM_2),
     DEFINE_KEYCODE(STEM_3),
+    DEFINE_KEYCODE(DPAD_UP_LEFT),
+    DEFINE_KEYCODE(DPAD_DOWN_LEFT),
+    DEFINE_KEYCODE(DPAD_UP_RIGHT),
+    DEFINE_KEYCODE(DPAD_DOWN_RIGHT),
     DEFINE_KEYCODE(MEDIA_SKIP_FORWARD),
     DEFINE_KEYCODE(MEDIA_SKIP_BACKWARD),
     DEFINE_KEYCODE(MEDIA_STEP_FORWARD),
     DEFINE_KEYCODE(MEDIA_STEP_BACKWARD),
     DEFINE_KEYCODE(SOFT_SLEEP),
+    DEFINE_KEYCODE(CUT),
+    DEFINE_KEYCODE(COPY),
+    DEFINE_KEYCODE(PASTE),
+    DEFINE_KEYCODE(SYSTEM_NAVIGATION_UP),
+    DEFINE_KEYCODE(SYSTEM_NAVIGATION_DOWN),
+    DEFINE_KEYCODE(SYSTEM_NAVIGATION_LEFT),
+    DEFINE_KEYCODE(SYSTEM_NAVIGATION_RIGHT),
+    DEFINE_KEYCODE(ALL_APPS),
 
     { NULL, 0 }
 };
@@ -414,30 +426,30 @@ static const char* lookupLabelByValue(int value, const InputEventLabel* list) {
     return NULL;
 }
 
-static int32_t getKeyCodeByLabel(const char* label) {
+static inline int32_t getKeyCodeByLabel(const char* label) {
     return int32_t(lookupValueByLabel(label, KEYCODES));
 }
 
-static const char* getLabelByKeyCode(int32_t keyCode) {
-    if (keyCode >= 0 && keyCode < size(KEYCODES)) {
+static inline const char* getLabelByKeyCode(int32_t keyCode) {
+    if (keyCode >= 0 && keyCode < static_cast<int32_t>(size(KEYCODES))) {
         return KEYCODES[keyCode].literal;
     }
     return NULL;
 }
 
-static uint32_t getKeyFlagByLabel(const char* label) {
+static inline uint32_t getKeyFlagByLabel(const char* label) {
     return uint32_t(lookupValueByLabel(label, FLAGS));
 }
 
-static int32_t getAxisByLabel(const char* label) {
+static inline int32_t getAxisByLabel(const char* label) {
     return int32_t(lookupValueByLabel(label, AXES));
 }
 
-static const char* getAxisLabel(int32_t axisId) {
+static inline const char* getAxisLabel(int32_t axisId) {
     return lookupLabelByValue(axisId, AXES);
 }
 
-static int32_t getLedByLabel(const char* label) {
+static inline int32_t getLedByLabel(const char* label) {
     return int32_t(lookupValueByLabel(label, LEDS));
 }
 

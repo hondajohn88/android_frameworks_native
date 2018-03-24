@@ -16,22 +16,24 @@
 */
 
 #include <assert.h>
+#include <atomic>
 #include <errno.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-#include <unistd.h>
 #include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
-#include <cutils/log.h>
-#include <cutils/atomic.h>
+#include <log/log.h>
 
 #include <utils/threads.h>
 #include <ui/ANativeObjectBase.h>
 #include <ui/Fence.h>
+#include <ui/GraphicBufferMapper.h>
+#include <ui/Rect.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -54,6 +56,24 @@
 EGLBoolean EGLAPI eglSetSwapRectangleANDROID(EGLDisplay dpy, EGLSurface draw,
         EGLint left, EGLint top, EGLint width, EGLint height);
 
+
+typedef struct egl_native_pixmap_t
+{
+    int32_t     version;    /* must be 32 */
+    int32_t     width;
+    int32_t     height;
+    int32_t     stride;
+    uint8_t*    data;
+    uint8_t     format;
+    uint8_t     rfu[3];
+    union {
+        uint32_t    compressedFormat;
+        int32_t     vstride;
+    };
+    int32_t     reserved;
+} egl_native_pixmap_t;
+
+
 // ----------------------------------------------------------------------------
 namespace android {
 
@@ -64,7 +84,7 @@ const unsigned int NUM_DISPLAYS = 1;
 static pthread_mutex_t gInitMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t gErrorKeyMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t gEGLErrorKey = -1;
-#ifndef HAVE_ANDROID_OS
+#ifndef __ANDROID__
 namespace gl {
 pthread_key_t gGLKey = -1;
 }; // namespace gl
@@ -107,8 +127,8 @@ struct egl_display_t
         return ((uintptr_t(dpy)-1U) >= NUM_DISPLAYS) ? EGL_FALSE : EGL_TRUE;
     }
 
-    NativeDisplayType   type;
-    volatile int32_t    initialized;
+    NativeDisplayType  type;
+    std::atomic_size_t initialized;
 };
 
 static egl_display_t gDisplays[NUM_DISPLAYS];
@@ -242,7 +262,6 @@ private:
     ANativeWindow*   nativeWindow;
     ANativeWindowBuffer*   buffer;
     ANativeWindowBuffer*   previousBuffer;
-    gralloc_module_t const*    module;
     int width;
     int height;
     void* bits;
@@ -341,16 +360,12 @@ egl_window_surface_v2_t::egl_window_surface_v2_t(EGLDisplay dpy,
         EGLConfig config,
         int32_t depthFormat,
         ANativeWindow* window)
-    : egl_surface_t(dpy, config, depthFormat), 
-    nativeWindow(window), buffer(0), previousBuffer(0), module(0),
-    bits(NULL)
+    : egl_surface_t(dpy, config, depthFormat),
+    nativeWindow(window), buffer(0), previousBuffer(0), bits(NULL)
 {
-    hw_module_t const* pModule;
-    hw_get_module(GRALLOC_HARDWARE_MODULE_ID, &pModule);
-    module = reinterpret_cast<gralloc_module_t const*>(pModule);
 
     pixelFormatTable = gglGetPixelFormatTable();
-    
+
     // keep a reference on the window
     nativeWindow->common.incRef(&nativeWindow->common);
     nativeWindow->query(nativeWindow, NATIVE_WINDOW_WIDTH, &width);
@@ -440,22 +455,16 @@ void egl_window_surface_v2_t::disconnect()
 status_t egl_window_surface_v2_t::lock(
         ANativeWindowBuffer* buf, int usage, void** vaddr)
 {
-    int err;
-
-    err = module->lock(module, buf->handle,
-            usage, 0, 0, buf->width, buf->height, vaddr);
-
-    return err;
+    auto& mapper = GraphicBufferMapper::get();
+    return mapper.lock(buf->handle, usage,
+            android::Rect(buf->width, buf->height), vaddr);
 }
 
 status_t egl_window_surface_v2_t::unlock(ANativeWindowBuffer* buf)
 {
     if (!buf) return BAD_VALUE;
-    int err = NO_ERROR;
-
-    err = module->unlock(module, buf->handle);
-
-    return err;
+    auto& mapper = GraphicBufferMapper::get();
+    return mapper.unlock(buf->handle);
 }
 
 void egl_window_surface_v2_t::copyBlt(
@@ -750,6 +759,7 @@ egl_pbuffer_surface_t::egl_pbuffer_surface_t(EGLDisplay dpy,
         case GGL_PIXEL_FORMAT_RGB_565:      size *= 2; break;
         case GGL_PIXEL_FORMAT_RGBA_8888:    size *= 4; break;
         case GGL_PIXEL_FORMAT_RGBX_8888:    size *= 4; break;
+        case GGL_PIXEL_FORMAT_BGRA_8888:    size *= 4; break;
         default:
             ALOGE("incompatible pixel format for pbuffer (format=%d)", f);
             pbuffer.data = 0;
@@ -1037,6 +1047,19 @@ static config_pair_t const config_7_attribute_list[] = {
         { EGL_SURFACE_TYPE,     EGL_WINDOW_BIT|EGL_PBUFFER_BIT|EGL_PIXMAP_BIT },
 };
 
+// BGRA 8888 config
+static config_pair_t const config_8_attribute_list[] = {
+        { EGL_BUFFER_SIZE,     32 },
+        { EGL_ALPHA_SIZE,       8 },
+        { EGL_BLUE_SIZE,        8 },
+        { EGL_GREEN_SIZE,       8 },
+        { EGL_RED_SIZE,         8 },
+        { EGL_DEPTH_SIZE,       0 },
+        { EGL_CONFIG_ID,        8 },
+        { EGL_NATIVE_VISUAL_ID, GGL_PIXEL_FORMAT_BGRA_8888 },
+        { EGL_SURFACE_TYPE,     EGL_WINDOW_BIT|EGL_PBUFFER_BIT|EGL_PIXMAP_BIT },
+};
+
 static configs_t const gConfigs[] = {
         { config_0_attribute_list, NELEM(config_0_attribute_list) },
         { config_1_attribute_list, NELEM(config_1_attribute_list) },
@@ -1046,6 +1069,7 @@ static configs_t const gConfigs[] = {
         { config_5_attribute_list, NELEM(config_5_attribute_list) },
         { config_6_attribute_list, NELEM(config_6_attribute_list) },
         { config_7_attribute_list, NELEM(config_7_attribute_list) },
+        { config_8_attribute_list, NELEM(config_8_attribute_list) },
 };
 
 static config_management_t const gConfigManagement[] = {
@@ -1127,6 +1151,10 @@ static status_t getConfigFormatInfo(EGLint configID,
     case 7:
         pixelFormat = GGL_PIXEL_FORMAT_A_8;
         depthFormat = GGL_PIXEL_FORMAT_Z_16;
+        break;
+    case 8:
+        pixelFormat = GGL_PIXEL_FORMAT_BGRA_8888;
+        depthFormat = 0;
         break;
     default:
         return NAME_NOT_FOUND;
@@ -1373,7 +1401,7 @@ static EGLSurface createPbufferSurface(EGLDisplay dpy, EGLConfig config,
 
     int32_t w = 0;
     int32_t h = 0;
-    while (attrib_list[0]) {
+    while (attrib_list[0] != EGL_NONE) {
         if (attrib_list[0] == EGL_WIDTH)  w = attrib_list[1];
         if (attrib_list[0] == EGL_HEIGHT) h = attrib_list[1];
         attrib_list+=2;
@@ -1403,7 +1431,7 @@ using namespace android;
 
 EGLDisplay eglGetDisplay(NativeDisplayType display)
 {
-#ifndef HAVE_ANDROID_OS
+#ifndef __ANDROID__
     // this just needs to be done once
     if (gGLKey == -1) {
         pthread_mutex_lock(&gInitMutex);
@@ -1429,7 +1457,7 @@ EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor)
     EGLBoolean res = EGL_TRUE;
     egl_display_t& d = egl_display_t::get_display(dpy);
 
-    if (android_atomic_inc(&d.initialized) == 0) {
+    if (d.initialized.fetch_add(1, std::memory_order_acquire) == 0) {
         // initialize stuff here if needed
         //pthread_mutex_lock(&gInitMutex);
         //pthread_mutex_unlock(&gInitMutex);
@@ -1449,7 +1477,8 @@ EGLBoolean eglTerminate(EGLDisplay dpy)
 
     EGLBoolean res = EGL_TRUE;
     egl_display_t& d = egl_display_t::get_display(dpy);
-    if (android_atomic_dec(&d.initialized) == 1) {
+    if (d.initialized.fetch_sub(1, std::memory_order_release) == 1) {
+        std::atomic_thread_fence(std::memory_order_acquire);
         // TODO: destroy all resources (surfaces, contexts, etc...)
         //pthread_mutex_lock(&gInitMutex);
         //pthread_mutex_unlock(&gInitMutex);
@@ -1467,6 +1496,9 @@ EGLBoolean eglGetConfigs(   EGLDisplay dpy,
 {
     if (egl_display_t::is_valid(dpy) == EGL_FALSE)
         return setError(EGL_BAD_DISPLAY, EGL_FALSE);
+
+    if (ggl_unlikely(num_config==NULL))
+        return setError(EGL_BAD_PARAMETER, EGL_FALSE);
 
     GLint numConfigs = NELEM(gConfigs);
     if (!configs) {
@@ -1487,8 +1519,8 @@ EGLBoolean eglChooseConfig( EGLDisplay dpy, const EGLint *attrib_list,
 {
     if (egl_display_t::is_valid(dpy) == EGL_FALSE)
         return setError(EGL_BAD_DISPLAY, EGL_FALSE);
-    
-    if (ggl_unlikely(num_config==0)) {
+
+    if (ggl_unlikely(num_config==NULL)) {
         return setError(EGL_BAD_PARAMETER, EGL_FALSE);
     }
 

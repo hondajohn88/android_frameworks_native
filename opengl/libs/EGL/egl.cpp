@@ -14,32 +14,24 @@
  ** limitations under the License.
  */
 
-#include <ctype.h>
 #include <stdlib.h>
-#include <string.h>
 
 #include <hardware/gralloc.h>
-#include <system/window.h>
 
 #include <EGL/egl.h>
-#include <EGL/eglext.h>
 
-#include <cutils/log.h>
-#include <cutils/atomic.h>
 #include <cutils/properties.h>
 
-#include <utils/CallStack.h>
-#include <utils/String8.h>
+#include <log/log.h>
 
 #include "../egl_impl.h"
-#include "../glestrace.h"
 
-#include "egl_tls.h"
 #include "egldefs.h"
-#include "Loader.h"
-
+#include "egl_tls.h"
 #include "egl_display.h"
 #include "egl_object.h"
+#include "CallStack.h"
+#include "Loader.h"
 
 typedef __eglMustCastToProperFunctionPointerType EGLFuncPointer;
 
@@ -54,160 +46,9 @@ pthread_key_t gGLWrapperKey = -1;
 
 // ----------------------------------------------------------------------------
 
-#if EGL_TRACE
-
-EGLAPI pthread_key_t gGLTraceKey = -1;
-
-// ----------------------------------------------------------------------------
-
-/**
- * There are three different tracing methods:
- * 1. libs/EGL/trace.cpp: Traces all functions to systrace.
- *    To enable:
- *      - set system property "debug.egl.trace" to "systrace" to trace all apps.
- * 2. libs/EGL/trace.cpp: Logs a stack trace for GL errors after each function call.
- *    To enable:
- *      - set system property "debug.egl.trace" to "error" to trace all apps.
- * 3. libs/EGL/trace.cpp: Traces all functions to logcat.
- *    To enable:
- *      - set system property "debug.egl.trace" to 1 to trace all apps.
- *      - or call setGLTraceLevel(1) from an app to enable tracing for that app.
- * 4. libs/GLES_trace: Traces all functions via protobuf to host.
- *    To enable:
- *        - set system property "debug.egl.debug_proc" to the application name.
- *      - or call setGLDebugLevel(1) from the app.
- */
-static int sEGLTraceLevel;
-static int sEGLApplicationTraceLevel;
-
-static bool sEGLSystraceEnabled;
-static bool sEGLGetErrorEnabled;
-
-static volatile int sEGLDebugLevel;
-
-extern gl_hooks_t gHooksTrace;
-extern gl_hooks_t gHooksSystrace;
-extern gl_hooks_t gHooksErrorTrace;
-
-int getEGLDebugLevel() {
-    return sEGLDebugLevel;
-}
-
-void setEGLDebugLevel(int level) {
-    sEGLDebugLevel = level;
-}
-
-static inline void setGlTraceThreadSpecific(gl_hooks_t const *value) {
-    pthread_setspecific(gGLTraceKey, value);
-}
-
-gl_hooks_t const* getGLTraceThreadSpecific() {
-    return static_cast<gl_hooks_t*>(pthread_getspecific(gGLTraceKey));
-}
-
-void initEglTraceLevel() {
-    char value[PROPERTY_VALUE_MAX];
-    property_get("debug.egl.trace", value, "0");
-
-    sEGLGetErrorEnabled = !strcasecmp(value, "error");
-    if (sEGLGetErrorEnabled) {
-        sEGLSystraceEnabled = false;
-        sEGLTraceLevel = 0;
-        return;
-    }
-
-    sEGLSystraceEnabled = !strcasecmp(value, "systrace");
-    if (sEGLSystraceEnabled) {
-        sEGLTraceLevel = 0;
-        return;
-    }
-
-    int propertyLevel = atoi(value);
-    int applicationLevel = sEGLApplicationTraceLevel;
-    sEGLTraceLevel = propertyLevel > applicationLevel ? propertyLevel : applicationLevel;
-}
-
-void initEglDebugLevel() {
-    if (getEGLDebugLevel() == 0) {
-        char value[PROPERTY_VALUE_MAX];
-
-        // check system property only on userdebug or eng builds
-        property_get("ro.debuggable", value, "0");
-        if (value[0] == '0')
-            return;
-
-        property_get("debug.egl.debug_proc", value, "");
-        if (strlen(value) > 0) {
-            FILE * file = fopen("/proc/self/cmdline", "r");
-            if (file) {
-                char cmdline[256];
-                if (fgets(cmdline, sizeof(cmdline), file)) {
-                    if (!strncmp(value, cmdline, strlen(value))) {
-                        // set EGL debug if the "debug.egl.debug_proc" property
-                        // matches the prefix of this application's command line
-                        setEGLDebugLevel(1);
-                    }
-                }
-                fclose(file);
-            }
-        }
-    }
-
-    if (getEGLDebugLevel() > 0) {
-        if (GLTrace_start() < 0) {
-            ALOGE("Error starting Tracer for OpenGL ES. Disabling..");
-            setEGLDebugLevel(0);
-        }
-    }
-}
-
-void setGLHooksThreadSpecific(gl_hooks_t const *value) {
-    if (sEGLGetErrorEnabled) {
-        setGlTraceThreadSpecific(value);
-        setGlThreadSpecific(&gHooksErrorTrace);
-    } else if (sEGLSystraceEnabled) {
-        setGlTraceThreadSpecific(value);
-        setGlThreadSpecific(&gHooksSystrace);
-    } else if (sEGLTraceLevel > 0) {
-        setGlTraceThreadSpecific(value);
-        setGlThreadSpecific(&gHooksTrace);
-    } else if (getEGLDebugLevel() > 0 && value != &gHooksNoContext) {
-        setGlTraceThreadSpecific(value);
-        setGlThreadSpecific(GLTrace_getGLHooks());
-    } else {
-        setGlTraceThreadSpecific(NULL);
-        setGlThreadSpecific(value);
-    }
-}
-
-/*
- * Global entry point to allow applications to modify their own trace level.
- * The effective trace level is the max of this level and the value of debug.egl.trace.
- */
-extern "C"
-void setGLTraceLevel(int level) {
-    sEGLApplicationTraceLevel = level;
-}
-
-/*
- * Global entry point to allow applications to modify their own debug level.
- * Debugging is enabled if either the application requested it, or if the system property
- * matches the application's name.
- * Note that this only sets the debug level. The value is read and used either in
- * initEglDebugLevel() if the application hasn't initialized its display yet, or when
- * eglSwapBuffers() is called next.
- */
-void EGLAPI setGLDebugLevel(int level) {
-    setEGLDebugLevel(level);
-}
-
-#else
-
 void setGLHooksThreadSpecific(gl_hooks_t const *value) {
     setGlThreadSpecific(value);
 }
-
-#endif
 
 /*****************************************************************************/
 
@@ -223,7 +64,7 @@ static int gl_no_context() {
         char value[PROPERTY_VALUE_MAX];
         property_get("debug.egl.callstack", value, "0");
         if (atoi(value)) {
-            CallStack stack(LOG_TAG);
+            CallStack::log(LOG_TAG);
         }
     }
     return 0;
@@ -231,10 +72,6 @@ static int gl_no_context() {
 
 static void early_egl_init(void)
 {
-#if EGL_TRACE
-    pthread_key_create(&gGLTraceKey, NULL);
-    initEglTraceLevel();
-#endif
     int numHooks = sizeof(gHooksNoContext) / sizeof(EGLFuncPointer);
     EGLFuncPointer *iter = reinterpret_cast<EGLFuncPointer*>(&gHooksNoContext);
     for (int hook = 0; hook < numHooks; ++hook) {
@@ -289,7 +126,7 @@ const GLubyte * egl_get_string_for_current_context(GLenum name) {
     if (name != GL_EXTENSIONS)
         return NULL;
 
-    return (const GLubyte *)c->gl_extensions.string();
+    return (const GLubyte *)c->gl_extensions.c_str();
 }
 
 const GLubyte * egl_get_string_for_current_context(GLenum name, GLuint index) {
@@ -312,7 +149,7 @@ const GLubyte * egl_get_string_for_current_context(GLenum name, GLuint index) {
     if (index >= c->tokenized_gl_extensions.size())
         return NULL;
 
-    return (const GLubyte *)c->tokenized_gl_extensions.itemAt(index).string();
+    return (const GLubyte *)c->tokenized_gl_extensions[index].c_str();
 }
 
 GLint egl_get_num_extensions_for_current_context() {
@@ -369,14 +206,14 @@ EGLBoolean egl_init_drivers() {
 }
 
 static pthread_mutex_t sLogPrintMutex = PTHREAD_MUTEX_INITIALIZER;
-static nsecs_t sLogPrintTime = 0;
-#define NSECS_DURATION 1000000000
+static std::chrono::steady_clock::time_point sLogPrintTime;
+static constexpr std::chrono::seconds DURATION(1);
 
 void gl_unimplemented() {
     bool printLog = false;
-    nsecs_t now = systemTime();
+    auto now = std::chrono::steady_clock::now();
     pthread_mutex_lock(&sLogPrintMutex);
-    if ((now - sLogPrintTime) > NSECS_DURATION) {
+    if ((now - sLogPrintTime) > DURATION) {
         sLogPrintTime = now;
         printLog = true;
     }
@@ -386,7 +223,7 @@ void gl_unimplemented() {
         char value[PROPERTY_VALUE_MAX];
         property_get("debug.egl.callstack", value, "0");
         if (atoi(value)) {
-            CallStack stack(LOG_TAG);
+            CallStack::log(LOG_TAG);
         }
     }
 }

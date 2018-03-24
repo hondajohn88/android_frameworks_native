@@ -25,7 +25,6 @@
  namespace android {
 
 GLHelper::GLHelper() :
-    mGraphicBufferAlloc(new GraphicBufferAlloc()),
     mDisplay(EGL_NO_DISPLAY),
     mContext(EGL_NO_CONTEXT),
     mDummySurface(EGL_NO_SURFACE),
@@ -203,11 +202,11 @@ bool GLHelper::createNamedSurfaceTexture(GLuint name, uint32_t w, uint32_t h,
         sp<GLConsumer>* glConsumer, EGLSurface* surface) {
     sp<IGraphicBufferProducer> producer;
     sp<IGraphicBufferConsumer> consumer;
-    BufferQueue::createBufferQueue(&producer, &consumer, mGraphicBufferAlloc);
+    BufferQueue::createBufferQueue(&producer, &consumer);
     sp<GLConsumer> glc = new GLConsumer(consumer, name,
             GL_TEXTURE_EXTERNAL_OES, false, true);
     glc->setDefaultBufferSize(w, h);
-    glc->setDefaultMaxBufferCount(3);
+    producer->setMaxDequeuedBufferCount(2);
     glc->setConsumerUsageBits(GRALLOC_USAGE_HW_COMPOSER);
 
     sp<ANativeWindow> anw = new Surface(producer);
@@ -365,6 +364,7 @@ static bool compileShaderLines(GLenum shaderType, const char* const* lines,
     if (!result) {
         fprintf(stderr, "Shader source:\n");
         printShaderSource(lines);
+        delete[] src;
         return false;
     }
     delete[] src;

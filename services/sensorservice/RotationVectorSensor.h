@@ -20,7 +20,7 @@
 #include <stdint.h>
 #include <sys/types.h>
 
-#include <gui/Sensor.h>
+#include <sensor/Sensor.h>
 
 #include "SensorDevice.h"
 #include "SensorInterface.h"
@@ -32,32 +32,36 @@
 namespace android {
 // ---------------------------------------------------------------------------
 
-class RotationVectorSensor : public SensorInterface {
-    SensorDevice& mSensorDevice;
-    SensorFusion& mSensorFusion;
-
+class RotationVectorSensor : public VirtualSensor {
 public:
-    RotationVectorSensor();
-    virtual bool process(sensors_event_t* outEvent,
-            const sensors_event_t& event);
-    virtual status_t activate(void* ident, bool enabled);
-    virtual status_t setDelay(void* ident, int handle, int64_t ns);
-    virtual Sensor getSensor() const;
-    virtual bool isVirtual() const { return true; }
+    explicit RotationVectorSensor(int mode = FUSION_9AXIS);
+    virtual bool process(sensors_event_t* outEvent, const sensors_event_t& event) override;
+    virtual status_t activate(void* ident, bool enabled) override;
+    virtual status_t setDelay(void* ident, int handle, int64_t ns) override;
+
+protected:
+    const int mMode;
+    int getSensorType() const;
+    const char* getSensorName() const ;
+    int getSensorToken() const ;
 };
 
-class GyroDriftSensor : public SensorInterface {
-    SensorDevice& mSensorDevice;
-    SensorFusion& mSensorFusion;
+class GameRotationVectorSensor : public RotationVectorSensor {
+public:
+    GameRotationVectorSensor() : RotationVectorSensor(FUSION_NOMAG) {}
+};
 
+class GeoMagRotationVectorSensor : public RotationVectorSensor {
+public:
+    GeoMagRotationVectorSensor() : RotationVectorSensor(FUSION_NOGYRO) {}
+};
+
+class GyroDriftSensor : public VirtualSensor {
 public:
     GyroDriftSensor();
-    virtual bool process(sensors_event_t* outEvent,
-            const sensors_event_t& event);
-    virtual status_t activate(void* ident, bool enabled);
-    virtual status_t setDelay(void* ident, int handle, int64_t ns);
-    virtual Sensor getSensor() const;
-    virtual bool isVirtual() const { return true; }
+    virtual bool process(sensors_event_t* outEvent, const sensors_event_t& event) override;
+    virtual status_t activate(void* ident, bool enabled) override;
+    virtual status_t setDelay(void* ident, int handle, int64_t ns) override;
 };
 
 // ---------------------------------------------------------------------------

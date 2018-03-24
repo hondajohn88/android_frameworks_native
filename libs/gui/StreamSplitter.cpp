@@ -31,6 +31,8 @@
 
 #include <utils/Trace.h>
 
+#include <system/window.h>
+
 namespace android {
 
 status_t StreamSplitter::createSplitter(
@@ -132,7 +134,7 @@ void StreamSplitter::onFrameAvailable(const BufferItem& /* item */) {
     ALOGV("acquired buffer %#" PRIx64 " from input",
             bufferItem.mGraphicBuffer->getId());
 
-    status = mInput->detachBuffer(bufferItem.mBuf);
+    status = mInput->detachBuffer(bufferItem.mSlot);
     LOG_ALWAYS_FATAL_IF(status != NO_ERROR,
             "detaching buffer from input failed (%d)", status);
 
@@ -144,8 +146,7 @@ void StreamSplitter::onFrameAvailable(const BufferItem& /* item */) {
             bufferItem.mTimestamp, bufferItem.mIsAutoTimestamp,
             bufferItem.mDataSpace, bufferItem.mCrop,
             static_cast<int32_t>(bufferItem.mScalingMode),
-            bufferItem.mTransform, bufferItem.mIsDroppable,
-            bufferItem.mFence);
+            bufferItem.mTransform, bufferItem.mFence);
 
     // Attach and queue the buffer to each of the outputs
     Vector<sp<IGraphicBufferProducer> >::iterator output = mOutputs.begin();

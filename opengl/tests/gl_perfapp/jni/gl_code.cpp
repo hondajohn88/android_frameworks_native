@@ -1,6 +1,6 @@
 // OpenGL ES 2.0 code
 
-#include <nativehelper/jni.h>
+#include <jni.h>
 #define LOG_TAG "GLPerf gl_code.cpp"
 #include <utils/Log.h>
 
@@ -26,8 +26,6 @@ uint32_t h;
 // The stateClock starts at zero and increments by 1 every time we draw a frame. It is used to control which phase of the test we are in.
 
 int stateClock;
-const int doLoopStates = 2;
-const int doSingleTestStates = 2;
 bool done;
 
 // Saves the parameters of the test (so we can print them out when we finish the timing.)
@@ -63,7 +61,7 @@ extern "C" {
     JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_step(JNIEnv * env, jobject obj);
 };
 
-JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_init(JNIEnv * env, jobject obj,  jint width, jint height)
+JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_init(JNIEnv * /*env*/, jobject /*obj*/,  jint width, jint height)
 {
     gWidth = width;
     gHeight = height;
@@ -89,7 +87,7 @@ JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_init(JNIEnv * env, jobj
     }
 }
 
-JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_step(JNIEnv * env, jobject obj)
+JNIEXPORT void JNICALL Java_com_android_glperf_GLPerfLib_step(JNIEnv * /*env*/, jobject /*obj*/)
 {
     if (! done) {
         if (stateClock > 0 && ((stateClock & 1) == 0)) {
