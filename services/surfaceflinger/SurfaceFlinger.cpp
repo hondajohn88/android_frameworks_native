@@ -30,7 +30,6 @@
 
 #include <EGL/egl.h>
 
-#include <bfqio/bfqio.h>
 #include <cutils/properties.h>
 #include <log/log.h>
 
@@ -99,20 +98,6 @@
 #define DEBUG_SCREENSHOTS   false
 
 extern "C" EGLAPI const char* eglQueryStringImplementationANDROID(EGLDisplay dpy, EGLint name);
-
-static int convertRotation(android::Transform::orientation_flags rotation)
-{
-    switch (rotation) {
-        case android::Transform::ROT_90:
-            return 1;
-        case android::Transform::ROT_180:
-            return 2;
-        case android::Transform::ROT_270:
-            return 3;
-        default:
-            return 0;
-    }
-}
 
 namespace android {
 
@@ -257,10 +242,6 @@ SurfaceFlinger::SurfaceFlinger()
     property_get("ro.sf.disable_triple_buffer", value, "1");
     mLayerTripleBufferingDisabled = atoi(value);
     ALOGI_IF(mLayerTripleBufferingDisabled, "Disabling Triple Buffering");
-
-    // we store the value as orientation:
-    // 90 -> 1, 180 -> 2, 270 -> 3
-    mHardwareRotation = property_get_int32("ro.sf.hwrotation", 0) / 90;
 
     // We should be reading 'persist.sys.sf.color_saturation' here
     // but since /data may be encrypted, we need to wait until after vold
@@ -647,7 +628,6 @@ void SurfaceFlinger::init() {
 
     mEventControlThread = new EventControlThread(this);
     mEventControlThread->run("EventControl", PRIORITY_URGENT_DISPLAY);
-    android_set_rt_ioprio(mEventControlThread->getTid(), 1);
 
     // initialize our drawing state
     mDrawingState = mCurrentState;
@@ -813,18 +793,10 @@ status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
             info.orientation = 0;
         }
 
-        if ((type == DisplayDevice::DISPLAY_PRIMARY) &&
-                (mHardwareRotation & DisplayState::eOrientationSwapMask)) {
-            info.h = hwConfig->getWidth();
-            info.w = hwConfig->getHeight();
-            info.xdpi = ydpi;
-            info.ydpi = xdpi;
-        } else {
-            info.w = hwConfig->getWidth();
-            info.h = hwConfig->getHeight();
-            info.xdpi = xdpi;
-            info.ydpi = ydpi;
-        }
+        info.w = hwConfig->getWidth();
+        info.h = hwConfig->getHeight();
+        info.xdpi = xdpi;
+        info.ydpi = ydpi;
         info.fps = 1e9 / hwConfig->getVsyncPeriod();
         info.appVsyncOffset = vsyncPhaseOffsetNs;
 
@@ -4181,27 +4153,14 @@ void SurfaceFlinger::repaintEverything() {
 // Checks that the requested width and height are valid and updates them to the display dimensions
 // if they are set to 0
 static status_t updateDimensionsLocked(const sp<const DisplayDevice>& displayDevice,
-                                       Transform::orientation_flags* rotation,
-                                       int32_t hardwareRotation,
+                                       Transform::orientation_flags rotation,
                                        uint32_t* requestedWidth, uint32_t* requestedHeight) {
     // get screen geometry
     uint32_t displayWidth = displayDevice->getWidth();
     uint32_t displayHeight = displayDevice->getHeight();
 
-    switch ((convertRotation(*rotation) + hardwareRotation) % 4) {
-        case 1:
-            std::swap(displayWidth, displayHeight);
-            *rotation = Transform::ROT_90;
-            break;
-        case 2:
-            *rotation = Transform::ROT_180;
-            break;
-        case 3:
-            std::swap(displayWidth, displayHeight);
-            *rotation = Transform::ROT_270;
-            break;
-        default:
-            break;
+    if (rotation & Transform::ROT_90) {
+        std::swap(displayWidth, displayHeight);
     }
 
     if ((*requestedWidth > displayWidth) || (*requestedHeight > displayHeight)) {
@@ -4309,8 +4268,7 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
     { // Autolock scope
         Mutex::Autolock lock(mStateLock);
         sp<const DisplayDevice> displayDevice(getDisplayDeviceLocked(display));
-        updateDimensionsLocked(displayDevice, &rotationFlags, mHardwareRotation,
-                &reqWidth, &reqHeight);
+        updateDimensionsLocked(displayDevice, rotationFlags, &reqWidth, &reqHeight);
     }
 
     // create a surface (because we're a producer, and we need to

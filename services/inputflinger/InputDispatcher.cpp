@@ -1794,11 +1794,6 @@ void InputDispatcher::pokeUserActivityLocked(const EventEntry* eventEntry) {
             & InputDispatcher::doPokeUserActivityLockedInterruptible);
     commandEntry->eventTime = eventEntry->eventTime;
     commandEntry->userActivityEventType = eventType;
-    if (eventType == USER_ACTIVITY_EVENT_BUTTON) {
-        const KeyEntry* keyEntry = static_cast<const KeyEntry*>(eventEntry);
-        commandEntry->keyEntry = const_cast<KeyEntry*>(keyEntry);
-        keyEntry->refCount += 1;
-    }
 }
 
 void InputDispatcher::prepareDispatchCycleLocked(nsecs_t currentTime,
@@ -1999,10 +1994,10 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             const PointerCoords* usingCoords = motionEntry->pointerCoords;
 
             // Set the X and Y offset depending on the input source.
-            float xOffset, yOffset, scaleFactor;
+            float xOffset, yOffset;
             if ((motionEntry->source & AINPUT_SOURCE_CLASS_POINTER)
                     && !(dispatchEntry->targetFlags & InputTarget::FLAG_ZERO_COORDS)) {
-                scaleFactor = dispatchEntry->scaleFactor;
+                float scaleFactor = dispatchEntry->scaleFactor;
                 xOffset = dispatchEntry->xOffset * scaleFactor;
                 yOffset = dispatchEntry->yOffset * scaleFactor;
                 if (scaleFactor != 1.0f) {
@@ -2015,7 +2010,6 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             } else {
                 xOffset = 0.0f;
                 yOffset = 0.0f;
-                scaleFactor = 1.0f;
 
                 // We don't want the dispatch target to know.
                 if (dispatchEntry->targetFlags & InputTarget::FLAG_ZERO_COORDS) {
@@ -3790,20 +3784,7 @@ bool InputDispatcher::afterMotionEventLockedInterruptible(const sp<Connection>& 
 void InputDispatcher::doPokeUserActivityLockedInterruptible(CommandEntry* commandEntry) {
     mLock.unlock();
 
-    int32_t keyCode = AKEYCODE_UNKNOWN;
-
-    if (commandEntry->userActivityEventType == USER_ACTIVITY_EVENT_BUTTON &&
-            commandEntry->keyEntry) {
-        keyCode = commandEntry->keyEntry->keyCode;
-    }
-
-    mPolicy->pokeUserActivity(commandEntry->eventTime, commandEntry->userActivityEventType,
-            keyCode);
-
-    if (commandEntry->userActivityEventType == USER_ACTIVITY_EVENT_BUTTON &&
-            commandEntry->keyEntry) {
-        commandEntry->keyEntry->release();
-    }
+    mPolicy->pokeUserActivity(commandEntry->eventTime, commandEntry->userActivityEventType);
 
     mLock.lock();
 }

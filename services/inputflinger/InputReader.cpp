@@ -117,9 +117,9 @@ static inline const char* toString(bool value) {
 }
 
 static int32_t rotateValueUsingRotationMap(int32_t value, int32_t orientation,
-        const int32_t map[][4], size_t mapSize, int32_t rotationMapOffset) {
+        const int32_t map[][4], size_t mapSize) {
     if (orientation != DISPLAY_ORIENTATION_0) {
-        for (size_t i = rotationMapOffset; i < mapSize; i++) {
+        for (size_t i = 0; i < mapSize; i++) {
             if (value == map[i][0]) {
                 return map[i][orientation];
             }
@@ -131,16 +131,6 @@ static int32_t rotateValueUsingRotationMap(int32_t value, int32_t orientation,
 static const int32_t keyCodeRotationMap[][4] = {
         // key codes enumerated counter-clockwise with the original (unrotated) key first
         // no rotation,        90 degree rotation,  180 degree rotation, 270 degree rotation
-
-        // volume keys - tablet
-        { AKEYCODE_VOLUME_UP,   AKEYCODE_VOLUME_UP,   AKEYCODE_VOLUME_DOWN, AKEYCODE_VOLUME_DOWN },
-        { AKEYCODE_VOLUME_DOWN, AKEYCODE_VOLUME_DOWN, AKEYCODE_VOLUME_UP,   AKEYCODE_VOLUME_UP },
-
-        // volume keys - phone or hybrid
-        { AKEYCODE_VOLUME_UP,   AKEYCODE_VOLUME_DOWN, AKEYCODE_VOLUME_DOWN, AKEYCODE_VOLUME_UP },
-        { AKEYCODE_VOLUME_DOWN, AKEYCODE_VOLUME_UP,   AKEYCODE_VOLUME_UP,   AKEYCODE_VOLUME_DOWN },
-
-        // dpad keys - common
         { AKEYCODE_DPAD_DOWN,   AKEYCODE_DPAD_RIGHT,  AKEYCODE_DPAD_UP,     AKEYCODE_DPAD_LEFT },
         { AKEYCODE_DPAD_RIGHT,  AKEYCODE_DPAD_UP,     AKEYCODE_DPAD_LEFT,   AKEYCODE_DPAD_DOWN },
         { AKEYCODE_DPAD_UP,     AKEYCODE_DPAD_LEFT,   AKEYCODE_DPAD_DOWN,   AKEYCODE_DPAD_RIGHT },
@@ -181,11 +171,11 @@ static int32_t stemKeyRotationMap[][2] = {
 static const size_t stemKeyRotationMapSize =
         sizeof(stemKeyRotationMap) / sizeof(stemKeyRotationMap[0]);
 
-static int32_t rotateKeyCode(int32_t keyCode, int32_t orientation, int32_t rotationMapOffset) {
+static int32_t rotateKeyCode(int32_t keyCode, int32_t orientation) {
     keyCode = rotateStemKey(keyCode, orientation,
             stemKeyRotationMap, stemKeyRotationMapSize);
     return rotateValueUsingRotationMap(keyCode, orientation,
-            keyCodeRotationMap, keyCodeRotationMapSize, rotationMapOffset);
+            keyCodeRotationMap, keyCodeRotationMapSize);
 }
 
 static void rotateDelta(int32_t orientation, float* deltaX, float* deltaY) {
@@ -2269,7 +2259,7 @@ void KeyboardInputMapper::dump(String8& dump) {
     dump.appendFormat(INDENT3 "Orientation: %d\n", mOrientation);
     dump.appendFormat(INDENT3 "KeyDowns: %zu keys currently down\n", mKeyDowns.size());
     dump.appendFormat(INDENT3 "MetaState: 0x%0x\n", mMetaState);
-    dump.appendFormat(INDENT3 "DownTime: %lld\n", (long long)mDownTime);
+    dump.appendFormat(INDENT3 "DownTime: %" PRId64 "\n", mDownTime);
 }
 
 
@@ -2294,13 +2284,6 @@ void KeyboardInputMapper::configure(nsecs_t when,
             mOrientation = DISPLAY_ORIENTATION_0;
         }
     }
-
-    if (!changes || (changes & InputReaderConfiguration::CHANGE_VOLUME_KEYS_ROTATION)) {
-        // mode 0 (disabled) ~ offset 4
-        // mode 1 (phone) ~ offset 2
-        // mode 2 (tablet) ~ offset 0
-        mRotationMapOffset = 4 - 2 * config->volumeKeysRotationMode;
-    }
 }
 
 static void mapStemKey(int32_t keyCode, const PropertyMap& config, char const *property) {
@@ -2316,7 +2299,7 @@ static void mapStemKey(int32_t keyCode, const PropertyMap& config, char const *p
 }
 
 void KeyboardInputMapper::configureParameters() {
-    mParameters.orientationAware = !getDevice()->isExternal();
+    mParameters.orientationAware = false;
     const PropertyMap& config = getDevice()->getConfiguration();
     config.tryGetProperty(String8("keyboard.orientationAware"),
             mParameters.orientationAware);
@@ -2435,7 +2418,7 @@ void KeyboardInputMapper::processKey(nsecs_t when, bool down, int32_t scanCode,
     if (down) {
         // Rotate key codes according to orientation if needed.
         if (mParameters.orientationAware && mParameters.hasAssociatedDisplay) {
-            keyCode = rotateKeyCode(keyCode, mOrientation, mRotationMapOffset);
+            keyCode = rotateKeyCode(keyCode, mOrientation);
         }
 
         // Add key down.
@@ -2637,7 +2620,7 @@ void CursorInputMapper::dump(String8& dump) {
     dump.appendFormat(INDENT3 "Orientation: %d\n", mOrientation);
     dump.appendFormat(INDENT3 "ButtonState: 0x%08x\n", mButtonState);
     dump.appendFormat(INDENT3 "Down: %s\n", toString(isPointerDown(mButtonState)));
-    dump.appendFormat(INDENT3 "DownTime: %lld\n", (long long)mDownTime);
+    dump.appendFormat(INDENT3 "DownTime: %" PRId64 "\n", mDownTime);
 }
 
 void CursorInputMapper::configure(nsecs_t when,
@@ -5526,18 +5509,15 @@ bool TouchInputMapper::preparePointerGestures(nsecs_t when,
     // Otherwise choose an arbitrary remaining pointer.
     // This guarantees we always have an active touch id when there is at least one pointer.
     // We keep the same active touch id for as long as possible.
-    bool activeTouchChanged = false;
     int32_t lastActiveTouchId = mPointerGesture.activeTouchId;
     int32_t activeTouchId = lastActiveTouchId;
     if (activeTouchId < 0) {
         if (!mCurrentCookedState.fingerIdBits.isEmpty()) {
-            activeTouchChanged = true;
             activeTouchId = mPointerGesture.activeTouchId =
                     mCurrentCookedState.fingerIdBits.firstMarkedBit();
             mPointerGesture.firstTouchTime = when;
         }
     } else if (!mCurrentCookedState.fingerIdBits.hasBit(activeTouchId)) {
-        activeTouchChanged = true;
         if (!mCurrentCookedState.fingerIdBits.isEmpty()) {
             activeTouchId = mPointerGesture.activeTouchId =
                     mCurrentCookedState.fingerIdBits.firstMarkedBit();
@@ -5633,7 +5613,6 @@ bool TouchInputMapper::preparePointerGestures(nsecs_t when,
             }
             if (bestId >= 0 && bestId != activeTouchId) {
                 mPointerGesture.activeTouchId = activeTouchId = bestId;
-                activeTouchChanged = true;
 #if DEBUG_GESTURES
                 ALOGD("Gestures: BUTTON_CLICK_OR_DRAG switched pointers, "
                         "bestId=%d, bestSpeed=%0.3f", bestId, bestSpeed);
